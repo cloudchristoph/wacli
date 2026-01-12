@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
@@ -189,4 +190,151 @@ func (a *App) BackfillHistory(ctx context.Context, opts BackfillOptions) (Backfi
 		MessagesAdded:  afterCount - beforeCount,
 		MessagesSynced: syncRes.MessagesStored,
 	}, nil
+}
+
+type BackfillAllOptions struct {
+	Count          int
+	Requests       int
+	WaitPerRequest time.Duration
+	IdleExit       time.Duration
+	Workers        int
+	MaxErrors      int
+}
+
+type BackfillAllResult struct {
+	ChatsProcessed int
+	ChatsSuccess   int
+	ChatsFailed    int
+	TotalRequests  int
+	TotalMessages  int64
+}
+
+type backfillJob struct {
+	chatJID string
+}
+
+func (a *App) BackfillAllChats(ctx context.Context, opts BackfillAllOptions) (BackfillAllResult, error) {
+	if opts.Workers <= 0 {
+		opts.Workers = 1
+	}
+	if opts.MaxErrors <= 0 {
+		opts.MaxErrors = 5
+	}
+	if opts.Count <= 0 {
+		opts.Count = 50
+	}
+	if opts.Requests <= 0 {
+		opts.Requests = 1
+	}
+	if opts.WaitPerRequest <= 0 {
+		opts.WaitPerRequest = 60 * time.Second
+	}
+	if opts.IdleExit <= 0 {
+		opts.IdleExit = 5 * time.Second
+	}
+
+	// Get all chats
+	chats, err := a.db.ListChats("", 0)
+	if err != nil {
+		return BackfillAllResult{}, fmt.Errorf("list chats: %w", err)
+	}
+
+	if len(chats) == 0 {
+		return BackfillAllResult{}, fmt.Errorf("no chats found in database")
+	}
+
+	fmt.Fprintf(os.Stderr, "Starting backfill for %d chats with %d worker(s)...\n", len(chats), opts.Workers)
+
+	// Create job channel
+	jobs := make(chan backfillJob, len(chats))
+	for _, chat := range chats {
+		jobs <- backfillJob{chatJID: chat.JID}
+	}
+	close(jobs)
+
+	// Atomic counters
+	var processed, success, failed atomic.Int64
+	var totalRequests, totalMessages atomic.Int64
+	var mu sync.Mutex
+
+	// Worker function
+	worker := func() error {
+		for job := range jobs {
+			// Check if we've exceeded max errors
+			if int(failed.Load()) >= opts.MaxErrors {
+				return fmt.Errorf("maximum error count (%d) reached", opts.MaxErrors)
+			}
+
+			result, err := a.BackfillHistory(ctx, BackfillOptions{
+				ChatJID:        job.chatJID,
+				Count:          opts.Count,
+				Requests:       opts.Requests,
+				WaitPerRequest: opts.WaitPerRequest,
+				IdleExit:       opts.IdleExit,
+			})
+
+			mu.Lock()
+			proc := processed.Add(1)
+			if err != nil {
+				failed.Add(1)
+				fmt.Fprintf(os.Stderr, "\rError backfilling %s: %v\n", job.chatJID, err)
+			} else {
+				success.Add(1)
+				totalRequests.Add(int64(result.RequestsSent))
+				totalMessages.Add(result.MessagesAdded)
+				if proc%10 == 0 {
+					fmt.Fprintf(os.Stderr, "\rProgress: %d/%d chats processed, %d successful, %d failed...",
+						proc, len(chats), success.Load(), failed.Load())
+				}
+			}
+			mu.Unlock()
+		}
+		return nil
+	}
+
+	// Start workers
+	var wg sync.WaitGroup
+	errCh := make(chan error, opts.Workers)
+
+	for i := 0; i < opts.Workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := worker(); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	// Check for worker errors
+	var workerErr error
+	select {
+	case workerErr = <-errCh:
+	default:
+	}
+
+	fmt.Fprintf(os.Stderr, "\nBackfill complete: %d chats processed, %d successful, %d failed\n",
+		processed.Load(), success.Load(), failed.Load())
+	fmt.Fprintf(os.Stderr, "Total: %d requests, %d messages added\n",
+		totalRequests.Load(), totalMessages.Load())
+
+	result := BackfillAllResult{
+		ChatsProcessed: int(processed.Load()),
+		ChatsSuccess:   int(success.Load()),
+		ChatsFailed:    int(failed.Load()),
+		TotalRequests:  int(totalRequests.Load()),
+		TotalMessages:  totalMessages.Load(),
+	}
+
+	if workerErr != nil {
+		return result, workerErr
+	}
+
+	return result, nil
 }

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/steipete/wacli/internal/pathutil"
@@ -139,4 +140,186 @@ func (a *App) downloadMediaJob(ctx context.Context, job mediaJob) error {
 
 	now := time.Now().UTC()
 	return a.db.MarkMediaDownloaded(info.ChatJID, info.MsgID, targetPath, now)
+}
+
+type DownloadMediaBatchOptions struct {
+	BasePath       string
+	ChatJID        string
+	MediaType      string
+	Workers        int
+	MaxErrors      int
+}
+
+type DownloadMediaBatchResult struct {
+	TotalFound     int
+	Downloaded     int
+	Skipped        int
+	Failed         int
+}
+
+func (a *App) DownloadMediaBatch(ctx context.Context, opts DownloadMediaBatchOptions) (DownloadMediaBatchResult, error) {
+	if opts.Workers <= 0 {
+		opts.Workers = 4
+	}
+	if opts.MaxErrors <= 0 {
+		opts.MaxErrors = 5
+	}
+
+	// Ensure authenticated
+	if err := a.EnsureAuthed(); err != nil {
+		return DownloadMediaBatchResult{}, err
+	}
+	if err := a.OpenWA(); err != nil {
+		return DownloadMediaBatchResult{}, err
+	}
+
+	// Get all messages with media
+	messages, err := a.db.ListMessagesWithMedia(opts.ChatJID, opts.MediaType)
+	if err != nil {
+		return DownloadMediaBatchResult{}, fmt.Errorf("list messages with media: %w", err)
+	}
+
+	if len(messages) == 0 {
+		return DownloadMediaBatchResult{}, fmt.Errorf("no undownloaded media found")
+	}
+
+	chatDesc := "all chats"
+	if opts.ChatJID != "" {
+		chatDesc = opts.ChatJID
+	}
+	mediaDesc := "all media types"
+	if opts.MediaType != "" {
+		mediaDesc = opts.MediaType
+	}
+	fmt.Fprintf(os.Stderr, "Starting download of %d media files from %s (%s) with %d worker(s)...\n",
+		len(messages), chatDesc, mediaDesc, opts.Workers)
+
+	// Atomic counters
+	var processed, downloaded, skipped, failed atomic.Int64
+	var mu sync.Mutex
+
+	// Create job channel
+	jobs := make(chan store.MediaDownloadInfo, len(messages))
+	for _, msg := range messages {
+		jobs <- msg
+	}
+	close(jobs)
+
+	// Worker function
+	worker := func() error {
+		for info := range jobs {
+			// Check if we've exceeded max errors
+			if int(failed.Load()) >= opts.MaxErrors {
+				return fmt.Errorf("maximum error count (%d) reached", opts.MaxErrors)
+			}
+
+			// Skip if already downloaded
+			if strings.TrimSpace(info.LocalPath) != "" {
+				skipped.Add(1)
+				processed.Add(1)
+				continue
+			}
+
+			// Skip if no media metadata
+			if strings.TrimSpace(info.MediaType) == "" || strings.TrimSpace(info.DirectPath) == "" || len(info.MediaKey) == 0 {
+				skipped.Add(1)
+				processed.Add(1)
+				continue
+			}
+
+			// Resolve output path with chat-based structure
+			basePath := opts.BasePath
+			if basePath == "" {
+				basePath = filepath.Join(a.opts.StoreDir, "media")
+			}
+			
+			// Create chat-based subdirectory
+			chatDir := filepath.Join(basePath, pathutil.SanitizeSegment(info.ChatJID))
+			filename := mediaFilename(info)
+			targetPath := filepath.Join(chatDir, filename)
+
+			if err := os.MkdirAll(chatDir, 0700); err != nil {
+				mu.Lock()
+				failed.Add(1)
+				fmt.Fprintf(os.Stderr, "\rError creating directory for %s/%s: %v\n", info.ChatJID, info.MsgID, err)
+				mu.Unlock()
+				processed.Add(1)
+				continue
+			}
+
+			// Download media
+			if _, err := a.wa.DownloadMediaToFile(ctx, info.DirectPath, info.FileEncSHA256, info.FileSHA256, info.MediaKey, info.FileLength, info.MediaType, "", targetPath); err != nil {
+				mu.Lock()
+				failed.Add(1)
+				fmt.Fprintf(os.Stderr, "\rError downloading %s/%s: %v\n", info.ChatJID, info.MsgID, err)
+				mu.Unlock()
+				processed.Add(1)
+				continue
+			}
+
+			// Mark as downloaded
+			now := time.Now().UTC()
+			if err := a.db.MarkMediaDownloaded(info.ChatJID, info.MsgID, targetPath, now); err != nil {
+				mu.Lock()
+				failed.Add(1)
+				fmt.Fprintf(os.Stderr, "\rError marking downloaded %s/%s: %v\n", info.ChatJID, info.MsgID, err)
+				mu.Unlock()
+				processed.Add(1)
+				continue
+			}
+
+			mu.Lock()
+			dl := downloaded.Add(1)
+			proc := processed.Add(1)
+			if proc%10 == 0 {
+				fmt.Fprintf(os.Stderr, "\rProgress: %d/%d processed, %d downloaded, %d skipped, %d failed...",
+					proc, len(messages), dl, skipped.Load(), failed.Load())
+			}
+			mu.Unlock()
+		}
+		return nil
+	}
+
+	// Start workers
+	var wg sync.WaitGroup
+	errCh := make(chan error, opts.Workers)
+
+	for i := 0; i < opts.Workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := worker(); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	// Check for worker errors
+	var workerErr error
+	select {
+	case workerErr = <-errCh:
+	default:
+	}
+
+	fmt.Fprintf(os.Stderr, "\nMedia download complete: %d processed, %d downloaded, %d skipped, %d failed\n",
+		processed.Load(), downloaded.Load(), skipped.Load(), failed.Load())
+
+	result := DownloadMediaBatchResult{
+		TotalFound: len(messages),
+		Downloaded: int(downloaded.Load()),
+		Skipped:    int(skipped.Load()),
+		Failed:     int(failed.Load()),
+	}
+
+	if workerErr != nil {
+		return result, workerErr
+	}
+
+	return result, nil
 }

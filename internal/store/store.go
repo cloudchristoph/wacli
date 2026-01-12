@@ -605,6 +605,84 @@ func (d *DB) MarkMediaDownloaded(chatJID, msgID, localPath string, downloadedAt 
 	return err
 }
 
+// ListMessagesWithMedia returns messages that have media and are not yet downloaded.
+// If chatJID is empty, it queries all chats.
+// If mediaTypeFilter is empty, it returns all media types.
+func (d *DB) ListMessagesWithMedia(chatJID, mediaTypeFilter string) ([]MediaDownloadInfo, error) {
+	query := `
+		SELECT m.chat_jid,
+		       COALESCE(c.name,''),
+		       m.msg_id,
+		       COALESCE(m.media_type,''),
+		       COALESCE(m.filename,''),
+		       COALESCE(m.mime_type,''),
+		       COALESCE(m.direct_path,''),
+		       m.media_key,
+		       m.file_sha256,
+		       m.file_enc_sha256,
+		       COALESCE(m.file_length,0),
+		       COALESCE(m.local_path,''),
+		       COALESCE(m.downloaded_at,0)
+		FROM messages m
+		LEFT JOIN chats c ON c.jid = m.chat_jid
+		WHERE m.media_type IS NOT NULL 
+		  AND m.media_type != ''
+		  AND (m.local_path IS NULL OR m.local_path = '')
+	`
+	args := []interface{}{}
+	
+	if chatJID != "" {
+		query += " AND m.chat_jid = ?"
+		args = append(args, chatJID)
+	}
+	
+	if mediaTypeFilter != "" {
+		query += " AND m.media_type = ?"
+		args = append(args, mediaTypeFilter)
+	}
+	
+	query += " ORDER BY m.ts DESC"
+	
+	rows, err := d.sql.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	
+	var results []MediaDownloadInfo
+	for rows.Next() {
+		var info MediaDownloadInfo
+		var fileLen sql.NullInt64
+		var downloadedAt int64
+		
+		if err := rows.Scan(
+			&info.ChatJID,
+			&info.ChatName,
+			&info.MsgID,
+			&info.MediaType,
+			&info.Filename,
+			&info.MimeType,
+			&info.DirectPath,
+			&info.MediaKey,
+			&info.FileSHA256,
+			&info.FileEncSHA256,
+			&fileLen,
+			&info.LocalPath,
+			&downloadedAt,
+		); err != nil {
+			return nil, err
+		}
+		
+		if fileLen.Valid && fileLen.Int64 > 0 {
+			info.FileLength = uint64(fileLen.Int64)
+		}
+		info.DownloadedAt = fromUnix(downloadedAt)
+		results = append(results, info)
+	}
+	
+	return results, rows.Err()
+}
+
 func (d *DB) MessageContext(chatJID, msgID string, before, after int) ([]Message, error) {
 	if before < 0 {
 		before = 0
