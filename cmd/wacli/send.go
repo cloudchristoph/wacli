@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steipete/wacli/internal/out"
 	"github.com/steipete/wacli/internal/store"
 	"github.com/steipete/wacli/internal/wa"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/types"
 )
 
 func newSendCmd(flags *rootFlags) *cobra.Command {
@@ -25,6 +29,8 @@ func newSendCmd(flags *rootFlags) *cobra.Command {
 func newSendTextCmd(flags *rootFlags) *cobra.Command {
 	var to string
 	var message string
+	var replyTo string
+	var replyChat string
 
 	cmd := &cobra.Command{
 		Use:   "text",
@@ -55,9 +61,52 @@ func newSendTextCmd(flags *rootFlags) *cobra.Command {
 				return err
 			}
 
-			msgID, err := a.WA().SendText(ctx, toJID, message)
-			if err != nil {
-				return err
+			var msgID types.MessageID
+			if strings.TrimSpace(replyTo) != "" {
+				// Build a quoted reply (reply-to). We fetch the quoted message from the local DB.
+				chatJID := toJID.String()
+				if strings.TrimSpace(replyChat) != "" {
+					cj, err := wa.ParseUserOrJID(replyChat)
+					if err != nil {
+						return fmt.Errorf("invalid --reply-chat: %w", err)
+					}
+					chatJID = cj.String()
+				}
+
+				qm, err := a.DB().GetMessage(chatJID, replyTo)
+				if err != nil {
+					if err == sql.ErrNoRows {
+						return fmt.Errorf("reply-to message not found in local DB (chat=%s id=%s). Run `wacli sync --follow` or `wacli history backfill --chat %s` and try again", chatJID, replyTo, chatJID)
+					}
+					return err
+				}
+
+				// Participant is required for group replies (sender of quoted message).
+				var participant *types.JID
+				if wa.IsGroupJID(toJID) && strings.TrimSpace(qm.SenderJID) != "" {
+					pj, err := types.ParseJID(qm.SenderJID)
+					if err == nil {
+						participant = &pj
+					}
+				}
+
+				quotedText := strings.TrimSpace(qm.Text)
+				if quotedText == "" {
+					quotedText = strings.TrimSpace(qm.DisplayText)
+				}
+				quotedMsg := &waProto.Message{Conversation: &quotedText}
+
+				id, err := a.WA().SendTextReply(ctx, toJID, message, replyTo, participant, quotedMsg)
+				if err != nil {
+					return err
+				}
+				msgID = id
+			} else {
+				id, err := a.WA().SendText(ctx, toJID, message)
+				if err != nil {
+					return err
+				}
+				msgID = id
 			}
 
 			now := time.Now().UTC()
@@ -90,5 +139,7 @@ func newSendTextCmd(flags *rootFlags) *cobra.Command {
 
 	cmd.Flags().StringVar(&to, "to", "", "recipient phone number or JID")
 	cmd.Flags().StringVar(&message, "message", "", "message text")
+	cmd.Flags().StringVar(&replyTo, "reply-to", "", "message id to reply to (stanza id)")
+	cmd.Flags().StringVar(&replyChat, "reply-chat", "", "chat JID/number where the reply-to message lives (defaults to --to)")
 	return cmd
 }
