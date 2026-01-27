@@ -203,6 +203,12 @@ func (c *Client) SendTextReply(ctx context.Context, to types.JID, text string, r
 	if strings.TrimSpace(replyToID) == "" {
 		return "", fmt.Errorf("replyToID is required")
 	}
+	// In groups, WhatsApp requires the quoted message sender (participant) to avoid "replying to you" bugs.
+	if to.Server == types.GroupServer {
+		if participantJID == nil || participantJID.IsEmpty() {
+			return "", fmt.Errorf("participantJID is required for group replies")
+		}
+	}
 
 	ctxInfo := &waProto.ContextInfo{StanzaID: strPtr(replyToID)}
 	if participantJID != nil && !participantJID.IsEmpty() {

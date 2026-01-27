@@ -83,11 +83,15 @@ func newSendTextCmd(flags *rootFlags) *cobra.Command {
 
 				// Participant is required for group replies (sender of quoted message).
 				var participant *types.JID
-				if wa.IsGroupJID(toJID) && strings.TrimSpace(qm.SenderJID) != "" {
-					pj, err := types.ParseJID(qm.SenderJID)
-					if err == nil {
-						participant = &pj
+				if wa.IsGroupJID(toJID) {
+					if strings.TrimSpace(qm.SenderJID) == "" {
+						return fmt.Errorf("reply-to in groups requires sender JID in local DB (missing SenderJID). Run `wacli sync --follow` or history backfill for %s", chatJID)
 					}
+					pj, err := types.ParseJID(qm.SenderJID)
+					if err != nil {
+						return fmt.Errorf("reply-to in groups requires a valid sender JID; got %q (parse error: %v)", qm.SenderJID, err)
+					}
+					participant = &pj
 				}
 
 				quotedText := strings.TrimSpace(qm.Text)
