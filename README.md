@@ -63,6 +63,11 @@ pnpm wacli history backfill --chat 1234567890@s.whatsapp.net --requests 10 --cou
 # Send a message
 pnpm wacli send text --to 1234567890 --message "hello"
 
+# Reply to a message (quoted reply)
+# Note: for group replies, wacli needs the original sender JID (participant).
+# Make sure the message exists in your local DB (run `wacli sync --follow` or `wacli history backfill`).
+pnpm wacli send text --to 120363000000000000@g.us --reply-to <message-id> --message "replying 👋"
+
 # Send a file
 ./wacli send file --to 1234567890 --file ./pic.jpg --caption "hi"
 # Or override display name
