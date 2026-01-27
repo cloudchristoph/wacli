@@ -18,9 +18,10 @@ import (
 var version = "dev"
 
 type rootFlags struct {
-	storeDir string
-	asJSON   bool
-	timeout  time.Duration
+	storeDir   string
+	asJSON     bool
+	fullOutput bool
+	timeout    time.Duration
 }
 
 func execute(args []string) error {
@@ -36,6 +37,7 @@ func execute(args []string) error {
 
 	rootCmd.PersistentFlags().StringVar(&flags.storeDir, "store", "", "store directory (default: ~/.wacli)")
 	rootCmd.PersistentFlags().BoolVar(&flags.asJSON, "json", false, "output JSON instead of human-readable text")
+	rootCmd.PersistentFlags().BoolVar(&flags.fullOutput, "full", false, "disable truncation in table output")
 	rootCmd.PersistentFlags().DurationVar(&flags.timeout, "timeout", 5*time.Minute, "command timeout (non-sync commands)")
 
 	rootCmd.AddCommand(newVersionCmd())

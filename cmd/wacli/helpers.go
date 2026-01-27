@@ -27,9 +27,12 @@ func parseTime(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unsupported time format %q (use RFC3339 or YYYY-MM-DD)", s)
 }
 
+func sanitize(s string) string {
+	return strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
+}
+
 func truncate(s string, max int) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	s = strings.TrimSpace(s)
+	s = sanitize(s)
 	if max <= 0 || len(s) <= max {
 		return s
 	}
@@ -37,4 +40,13 @@ func truncate(s string, max int) string {
 		return s[:max]
 	}
 	return s[:max-1] + "…"
+}
+
+// truncateForDisplay truncates strings for tabular output.
+// When forceFull is true or stdout is not a TTY (piped), returns the full string.
+func truncateForDisplay(s string, max int, forceFull bool) string {
+	if forceFull || !isTTY() {
+		return sanitize(s)
+	}
+	return truncate(s, max)
 }
