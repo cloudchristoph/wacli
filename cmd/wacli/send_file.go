@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,10 +20,75 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// getAudioDuration returns the duration of an audio file in seconds using ffprobe
+func getAudioDuration(filePath string) (uint32, error) {
+	cmd := exec.Command("ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", filePath)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return 0, err
+	}
+	duration, err := strconv.ParseFloat(strings.TrimSpace(out.String()), 64)
+	if err != nil {
+		return 0, err
+	}
+	return uint32(duration), nil
+}
+
+// generateWaveform generates a realistic-looking 64-byte waveform for voice messages
+func generateWaveform(filePath string) []byte {
+	waveform := make([]byte, 64)
+	
+	// Seed with file path for consistent but varied results per file
+	seed := int64(0)
+	for _, c := range filePath {
+		seed += int64(c)
+	}
+	seed += time.Now().UnixNano()
+	
+	// Simulate realistic speech pattern with words and pauses
+	inWord := true
+	wordEnergy := byte(40)
+	
+	for i := 0; i < 64; i++ {
+		// Random chance to switch between word/pause
+		randVal := (seed + int64(i*17)) % 100
+		
+		if randVal < 8 { // 8% chance to toggle
+			inWord = !inWord
+			if inWord {
+				// New word - random energy level
+				wordEnergy = byte(25 + (seed+int64(i*31))%45) // 25-70
+			}
+		}
+		
+		if inWord {
+			// Speaking - vary around word energy
+			variation := int64((seed+int64(i*23))%30) - 15 // -15 to +15
+			val := int64(wordEnergy) + variation
+			// Add micro-variations for naturalness
+			microVar := (seed + int64(i*13)) % 10 - 5
+			val += microVar
+			
+			if val < 15 {
+				val = 15
+			} else if val > 80 {
+				val = 80
+			}
+			waveform[i] = byte(val)
+		} else {
+			// Pause - low but not zero (breath, ambient)
+			pause := byte(5 + (seed+int64(i*7))%12) // 5-17
+			waveform[i] = pause
+		}
+	}
+	return waveform
+}
+
 func sendFile(ctx context.Context, a interface {
 	WA() app.WAClient
 	DB() *store.DB
-}, to types.JID, filePath, filename, caption, mimeOverride string) (string, map[string]string, error) {
+}, to types.JID, filePath, filename, caption, mimeOverride string, ptt bool) (string, map[string]string, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return "", nil, err
@@ -89,7 +157,7 @@ func sendFile(ctx context.Context, a interface {
 			Caption:       proto.String(caption),
 		}
 	case "audio":
-		msg.AudioMessage = &waProto.AudioMessage{
+		audioMsg := &waProto.AudioMessage{
 			URL:           proto.String(up.URL),
 			DirectPath:    proto.String(up.DirectPath),
 			MediaKey:      up.MediaKey,
@@ -97,8 +165,20 @@ func sendFile(ctx context.Context, a interface {
 			FileSHA256:    up.FileSHA256,
 			FileLength:    proto.Uint64(up.FileLength),
 			Mimetype:      proto.String(mimeType),
-			PTT:           proto.Bool(false),
+			PTT:           proto.Bool(ptt),
 		}
+		if ptt {
+			// For PTT voice messages, force correct mimetype and add required fields
+			audioMsg.Mimetype = proto.String("audio/ogg; codecs=opus")
+			audioMsg.MediaKeyTimestamp = proto.Int64(now.Unix())
+			// Add duration
+			if duration, err := getAudioDuration(filePath); err == nil {
+				audioMsg.Seconds = proto.Uint32(duration)
+			}
+			// Add waveform (64 bytes)
+			audioMsg.Waveform = generateWaveform(filePath)
+		}
+		msg.AudioMessage = audioMsg
 	default:
 		msg.DocumentMessage = &waProto.DocumentMessage{
 			URL:           proto.String(up.URL),
