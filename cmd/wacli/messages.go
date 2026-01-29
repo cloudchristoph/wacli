@@ -22,6 +22,7 @@ func newMessagesCmd(flags *rootFlags) *cobra.Command {
 	cmd.AddCommand(newMessagesSearchCmd(flags))
 	cmd.AddCommand(newMessagesShowCmd(flags))
 	cmd.AddCommand(newMessagesContextCmd(flags))
+	cmd.AddCommand(newMessagesStarredCmd(flags))
 	return cmd
 }
 
@@ -30,6 +31,7 @@ func newMessagesListCmd(flags *rootFlags) *cobra.Command {
 	var limit int
 	var afterStr string
 	var beforeStr string
+	var starred bool
 
 	cmd := &cobra.Command{
 		Use:   "list",
@@ -66,6 +68,7 @@ func newMessagesListCmd(flags *rootFlags) *cobra.Command {
 				Limit:   limit,
 				After:   after,
 				Before:  before,
+				Starred: starred,
 			})
 			if err != nil {
 				return err
@@ -113,6 +116,7 @@ func newMessagesListCmd(flags *rootFlags) *cobra.Command {
 	cmd.Flags().IntVar(&limit, "limit", 50, "limit results")
 	cmd.Flags().StringVar(&afterStr, "after", "", "only messages after time (RFC3339 or YYYY-MM-DD)")
 	cmd.Flags().StringVar(&beforeStr, "before", "", "only messages before time (RFC3339 or YYYY-MM-DD)")
+	cmd.Flags().BoolVar(&starred, "starred", false, "only starred messages")
 	return cmd
 }
 
@@ -123,6 +127,7 @@ func newMessagesSearchCmd(flags *rootFlags) *cobra.Command {
 	var afterStr string
 	var beforeStr string
 	var msgType string
+	var starred bool
 
 	cmd := &cobra.Command{
 		Use:   "search <query>",
@@ -163,6 +168,7 @@ func newMessagesSearchCmd(flags *rootFlags) *cobra.Command {
 				After:   after,
 				Before:  before,
 				Type:    msgType,
+				Starred: starred,
 			})
 			if err != nil {
 				return err
@@ -215,6 +221,7 @@ func newMessagesSearchCmd(flags *rootFlags) *cobra.Command {
 	cmd.Flags().StringVar(&afterStr, "after", "", "only messages after time (RFC3339 or YYYY-MM-DD)")
 	cmd.Flags().StringVar(&beforeStr, "before", "", "only messages before time (RFC3339 or YYYY-MM-DD)")
 	cmd.Flags().StringVar(&msgType, "type", "", "media type filter (image|video|audio|document)")
+	cmd.Flags().BoolVar(&starred, "starred", false, "only starred messages")
 	return cmd
 }
 
@@ -330,5 +337,80 @@ func newMessagesContextCmd(flags *rootFlags) *cobra.Command {
 	cmd.Flags().StringVar(&id, "id", "", "message ID")
 	cmd.Flags().IntVar(&before, "before", 5, "messages before")
 	cmd.Flags().IntVar(&after, "after", 5, "messages after")
+	return cmd
+}
+
+func newMessagesStarredCmd(flags *rootFlags) *cobra.Command {
+	var chat string
+	var afterStr string
+
+	cmd := &cobra.Command{
+		Use:   "starred",
+		Short: "List starred messages",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := withTimeout(context.Background(), flags)
+			defer cancel()
+
+			a, lk, err := newApp(ctx, flags, false, false)
+			if err != nil {
+				return err
+			}
+			defer closeApp(a, lk)
+
+			var after time.Time
+			if afterStr != "" {
+				t, err := parseTime(afterStr)
+				if err != nil {
+					return err
+				}
+				after = t
+			}
+
+			msgs, err := a.DB().ListStarred(chat, after)
+			if err != nil {
+				return err
+			}
+
+			if flags.asJSON {
+				return out.WriteJSON(os.Stdout, map[string]any{
+					"starred": msgs,
+				})
+			}
+
+			w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+			fmt.Fprintln(w, "STARRED\tCHAT\tFROM\tID\tTEXT")
+			for _, m := range msgs {
+				from := m.SenderJID
+				if m.FromMe {
+					from = "me"
+				} else if from == "" {
+					from = "unknown"
+				}
+				chatLabel := m.ChatName
+				if chatLabel == "" {
+					chatLabel = m.ChatJID
+				}
+				text := strings.TrimSpace(m.DisplayText)
+				if text == "" {
+					text = strings.TrimSpace(m.Text)
+				}
+				if m.MediaType != "" && text == "" {
+					text = "Sent " + m.MediaType
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+					m.StarredAt.Local().Format("2006-01-02 15:04:05"),
+					truncate(chatLabel, 24),
+					truncate(from, 18),
+					truncate(m.MsgID, 14),
+					truncate(text, 80),
+				)
+			}
+			_ = w.Flush()
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&chat, "chat", "", "chat JID")
+	cmd.Flags().StringVar(&afterStr, "after", "", "only messages starred after time (RFC3339 or YYYY-MM-DD)")
 	return cmd
 }

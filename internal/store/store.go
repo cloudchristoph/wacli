@@ -135,6 +135,14 @@ func (d *DB) ensureSchema() error {
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid) ON DELETE CASCADE
 		);
 
+		CREATE TABLE IF NOT EXISTS starred (
+			chat_jid TEXT NOT NULL,
+			sender_jid TEXT NOT NULL,
+			msg_id TEXT NOT NULL,
+			starred_at INTEGER NOT NULL,
+			PRIMARY KEY (chat_jid, msg_id)
+		);
+
 		CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, ts);
 		CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
 	`); err != nil {
@@ -346,6 +354,19 @@ type MessageInfo struct {
 	SenderName string
 }
 
+type StarredMessage struct {
+	ChatJID     string
+	ChatName    string
+	SenderJID   string
+	MsgID       string
+	StarredAt   time.Time
+	Timestamp   time.Time
+	FromMe      bool
+	Text        string
+	DisplayText string
+	MediaType   string
+}
+
 type Contact struct {
 	JID       string
 	Phone     string
@@ -456,17 +477,23 @@ type ListMessagesParams struct {
 	Limit   int
 	Before  *time.Time
 	After   *time.Time
+	Starred bool
 }
 
 func (d *DB) ListMessages(p ListMessagesParams) ([]Message, error) {
 	if p.Limit <= 0 {
 		p.Limit = 50
 	}
-	query := `
+	starJoin := ""
+	if p.Starred {
+		starJoin = "JOIN starred s ON s.chat_jid = m.chat_jid AND s.msg_id = m.msg_id"
+	}
+	query := fmt.Sprintf(`
 		SELECT m.chat_jid, COALESCE(c.name,''), m.msg_id, COALESCE(m.sender_jid,''), m.ts, m.from_me, COALESCE(m.text,''), COALESCE(m.display_text,''), COALESCE(m.media_type,'')
 		FROM messages m
+		%s
 		LEFT JOIN chats c ON c.jid = m.chat_jid
-		WHERE 1=1`
+		WHERE 1=1`, starJoin)
 	var args []interface{}
 	if strings.TrimSpace(p.ChatJID) != "" {
 		query += " AND m.chat_jid = ?"
@@ -504,6 +531,79 @@ func (d *DB) ListMessages(p ListMessagesParams) ([]Message, error) {
 	return out, rows.Err()
 }
 
+func (d *DB) SetStarred(chatJID, senderJID, msgID string, starred bool, ts time.Time) error {
+	chatJID = strings.TrimSpace(chatJID)
+	msgID = strings.TrimSpace(msgID)
+	if chatJID == "" || msgID == "" {
+		return fmt.Errorf("chat JID and message ID are required")
+	}
+	if !starred {
+		_, err := d.sql.Exec(`DELETE FROM starred WHERE chat_jid = ? AND msg_id = ?`, chatJID, msgID)
+		return err
+	}
+	if ts.IsZero() {
+		ts = time.Now().UTC()
+	}
+	_, err := d.sql.Exec(`
+		INSERT INTO starred(chat_jid, sender_jid, msg_id, starred_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(chat_jid, msg_id) DO UPDATE SET
+			sender_jid=excluded.sender_jid,
+			starred_at=excluded.starred_at
+	`, chatJID, senderJID, msgID, unix(ts))
+	return err
+}
+
+func (d *DB) ListStarred(chatJID string, after time.Time) ([]StarredMessage, error) {
+	query := `
+		SELECT s.chat_jid,
+		       COALESCE(c.name,''),
+		       s.sender_jid,
+		       s.msg_id,
+		       s.starred_at,
+		       COALESCE(m.ts,0),
+		       COALESCE(m.from_me,0),
+		       COALESCE(m.text,''),
+		       COALESCE(m.display_text,''),
+		       COALESCE(m.media_type,'')
+		FROM starred s
+		LEFT JOIN messages m ON m.chat_jid = s.chat_jid AND m.msg_id = s.msg_id
+		LEFT JOIN chats c ON c.jid = s.chat_jid
+		WHERE 1=1`
+	var args []interface{}
+	if strings.TrimSpace(chatJID) != "" {
+		query += " AND s.chat_jid = ?"
+		args = append(args, chatJID)
+	}
+	if !after.IsZero() {
+		query += " AND s.starred_at > ?"
+		args = append(args, unix(after))
+	}
+	query += " ORDER BY s.starred_at DESC"
+
+	rows, err := d.sql.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []StarredMessage
+	for rows.Next() {
+		var s StarredMessage
+		var starredAt int64
+		var msgTS int64
+		var fromMe int
+		if err := rows.Scan(&s.ChatJID, &s.ChatName, &s.SenderJID, &s.MsgID, &starredAt, &msgTS, &fromMe, &s.Text, &s.DisplayText, &s.MediaType); err != nil {
+			return nil, err
+		}
+		s.StarredAt = fromUnix(starredAt)
+		s.Timestamp = fromUnix(msgTS)
+		s.FromMe = fromMe != 0
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 type SearchMessagesParams struct {
 	Query   string
 	ChatJID string
@@ -512,6 +612,7 @@ type SearchMessagesParams struct {
 	Before  *time.Time
 	After   *time.Time
 	Type    string
+	Starred bool
 }
 
 func (d *DB) SearchMessages(p SearchMessagesParams) ([]Message, error) {
@@ -529,11 +630,16 @@ func (d *DB) SearchMessages(p SearchMessagesParams) ([]Message, error) {
 }
 
 func (d *DB) searchLIKE(p SearchMessagesParams) ([]Message, error) {
-	query := `
+	starJoin := ""
+	if p.Starred {
+		starJoin = "JOIN starred s ON s.chat_jid = m.chat_jid AND s.msg_id = m.msg_id"
+	}
+	query := fmt.Sprintf(`
 		SELECT m.chat_jid, COALESCE(c.name,''), m.msg_id, COALESCE(m.sender_jid,''), m.ts, m.from_me, COALESCE(m.text,''), COALESCE(m.display_text,''), COALESCE(m.media_type,''), ''
 		FROM messages m
+		%s
 		LEFT JOIN chats c ON c.jid = m.chat_jid
-		WHERE (LOWER(m.text) LIKE LOWER(?) OR LOWER(m.display_text) LIKE LOWER(?) OR LOWER(m.media_caption) LIKE LOWER(?) OR LOWER(m.filename) LIKE LOWER(?) OR LOWER(COALESCE(m.chat_name,'')) LIKE LOWER(?) OR LOWER(COALESCE(m.sender_name,'')) LIKE LOWER(?) OR LOWER(COALESCE(c.name,'')) LIKE LOWER(?))`
+		WHERE (LOWER(m.text) LIKE LOWER(?) OR LOWER(m.display_text) LIKE LOWER(?) OR LOWER(m.media_caption) LIKE LOWER(?) OR LOWER(m.filename) LIKE LOWER(?) OR LOWER(COALESCE(m.chat_name,'')) LIKE LOWER(?) OR LOWER(COALESCE(m.sender_name,'')) LIKE LOWER(?) OR LOWER(COALESCE(c.name,'')) LIKE LOWER(?))`, starJoin)
 	needle := "%" + p.Query + "%"
 	args := []interface{}{needle, needle, needle, needle, needle, needle, needle}
 	query, args = applyMessageFilters(query, args, p)
@@ -543,13 +649,18 @@ func (d *DB) searchLIKE(p SearchMessagesParams) ([]Message, error) {
 }
 
 func (d *DB) searchFTS(p SearchMessagesParams) ([]Message, error) {
-	query := `
+	starJoin := ""
+	if p.Starred {
+		starJoin = "JOIN starred s ON s.chat_jid = m.chat_jid AND s.msg_id = m.msg_id"
+	}
+	query := fmt.Sprintf(`
 		SELECT m.chat_jid, COALESCE(c.name,''), m.msg_id, COALESCE(m.sender_jid,''), m.ts, m.from_me, COALESCE(m.text,''), COALESCE(m.display_text,''), COALESCE(m.media_type,''),
 		       snippet(messages_fts, 0, '[', ']', '…', 12)
 		FROM messages_fts
 		JOIN messages m ON messages_fts.rowid = m.rowid
+		%s
 		LEFT JOIN chats c ON c.jid = m.chat_jid
-		WHERE messages_fts MATCH ?`
+		WHERE messages_fts MATCH ?`, starJoin)
 	args := []interface{}{p.Query}
 	query, args = applyMessageFilters(query, args, p)
 	query += " ORDER BY bm25(messages_fts) LIMIT ?"

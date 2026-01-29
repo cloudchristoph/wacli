@@ -130,6 +130,11 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 				}
 			}
 			fmt.Fprintf(os.Stderr, "\rSynced %d messages...", messagesStored.Load())
+		case *events.Star:
+			if v == nil || v.Action == nil {
+				return
+			}
+			_ = a.db.SetStarred(v.ChatJID.String(), v.SenderJID.String(), v.MessageID, v.Action.GetStarred(), v.Timestamp)
 		case *events.Connected:
 			fmt.Fprintln(os.Stderr, "\nConnected.")
 		case *events.Disconnected:

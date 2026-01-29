@@ -42,3 +42,4 @@ go.work.sum
 
 # pnpm build output
 /dist/
+wacli-dev
