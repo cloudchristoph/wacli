@@ -9,6 +9,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/steipete/wacli/internal/store"
 )
 
 func TestImportIPhoneBackup(t *testing.T) {
@@ -115,6 +116,75 @@ func TestImportIPhoneBackup(t *testing.T) {
 	}
 }
 
+func TestImportIPhoneBackupMergesExistingAlternateChatIdentity(t *testing.T) {
+	ctx := context.Background()
+	backupDir := t.TempDir()
+	chatDBPath := filepath.Join(backupDir, "ChatStorage.sqlite")
+	contactsDBPath := filepath.Join(backupDir, "ContactsV2.sqlite")
+	seedBackupDatabases(t, chatDBPath, contactsDBPath)
+
+	appDir := t.TempDir()
+	a, err := New(Options{StoreDir: appDir, AllowUnauthed: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer a.Close()
+
+	seedLIDMap(t, filepath.Join(appDir, "session.db"), "lid-alice", "491234567890")
+
+	oldTS := time.Date(2024, 3, 1, 8, 0, 0, 0, time.UTC)
+	if err := a.DB().UpsertChat("lid-alice@lid", "dm", "Alice via LID", oldTS); err != nil {
+		t.Fatalf("UpsertChat lid: %v", err)
+	}
+	if err := a.DB().UpsertMessage(store.UpsertMessageParams{
+		ChatJID:    "lid-alice@lid",
+		ChatName:   "Alice via LID",
+		MsgID:      "old-lid-msg",
+		SenderJID:  "lid-alice@lid",
+		SenderName: "Alice via LID",
+		Timestamp:  oldTS,
+		Text:       "preexisting lid message",
+	}); err != nil {
+		t.Fatalf("UpsertMessage lid: %v", err)
+	}
+
+	if _, err := a.ImportIPhoneBackup(ctx, backupDir, IPhoneBackupImportOptions{}); err != nil {
+		t.Fatalf("ImportIPhoneBackup: %v", err)
+	}
+
+	if _, err := a.DB().GetChat("lid-alice@lid"); !store.IsNotFound(err) {
+		t.Fatalf("expected lid chat to be merged away, err=%v", err)
+	}
+
+	chat, err := a.DB().GetChat("491234567890@s.whatsapp.net")
+	if err != nil {
+		t.Fatalf("GetChat canonical: %v", err)
+	}
+	if chat.Name == "" {
+		t.Fatalf("expected canonical chat to retain a name, got %+v", chat)
+	}
+
+	oldMsg, err := a.DB().GetMessage("491234567890@s.whatsapp.net", "old-lid-msg")
+	if err != nil {
+		t.Fatalf("GetMessage merged old lid msg: %v", err)
+	}
+	if oldMsg.ChatJID != "491234567890@s.whatsapp.net" {
+		t.Fatalf("expected old message to move to canonical chat, got %+v", oldMsg)
+	}
+
+	if _, err := a.DB().GetMessage("491234567890@s.whatsapp.net", "m1"); err != nil {
+		t.Fatalf("GetMessage imported canonical msg: %v", err)
+	}
+
+	count, err := a.DB().CountMessages()
+	if err != nil {
+		t.Fatalf("CountMessages: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("expected 3 total messages after merge+import, got %d", count)
+	}
+}
+
 func seedBackupDatabases(t *testing.T, chatDBPath, contactsDBPath string) {
 	t.Helper()
 	chatDB := openSQLite(t, chatDBPath)
@@ -216,6 +286,14 @@ func openSQLite(t *testing.T, path string) *sql.DB {
 		t.Fatalf("sql.Open(%s): %v", path, err)
 	}
 	return db
+}
+
+func seedLIDMap(t *testing.T, sessionDBPath, lid, pn string) {
+	t.Helper()
+	db := openSQLite(t, sessionDBPath)
+	defer db.Close()
+	mustExec(t, db, `CREATE TABLE whatsmeow_lid_map (lid TEXT, pn TEXT)`)
+	mustExec(t, db, `INSERT INTO whatsmeow_lid_map (lid, pn) VALUES (?, ?)`, lid, pn)
 }
 
 func mustExec(t *testing.T, db *sql.DB, q string, args ...any) {

@@ -70,6 +70,12 @@ type backupMediaItem struct {
 	MediaKey      []byte
 }
 
+type backupImportCanonicalizer struct {
+	app       *App
+	canonical map[string]string
+	merged    map[string]bool
+}
+
 func (a *App) ImportIPhoneBackup(ctx context.Context, backupDir string, opts IPhoneBackupImportOptions) (IPhoneBackupImportResult, error) {
 	backupDir = strings.TrimSpace(backupDir)
 	if backupDir == "" {
@@ -85,6 +91,11 @@ func (a *App) ImportIPhoneBackup(ctx context.Context, backupDir string, opts IPh
 	}
 
 	res := IPhoneBackupImportResult{BackupPath: absBackupDir}
+	canon := &backupImportCanonicalizer{
+		app:       a,
+		canonical: make(map[string]string),
+		merged:    make(map[string]bool),
+	}
 
 	chatDB, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?mode=ro&_busy_timeout=5000", chatPath))
 	if err != nil {
@@ -100,7 +111,7 @@ func (a *App) ImportIPhoneBackup(ctx context.Context, backupDir string, opts IPh
 			return res, fmt.Errorf("open ContactsV2.sqlite: %w", err)
 		}
 		defer contactsDB.Close()
-		imported, err := a.importBackupContacts(ctx, contactsDB, contactNames)
+		imported, err := a.importBackupContacts(ctx, contactsDB, canon, contactNames)
 		if err != nil {
 			return res, err
 		}
@@ -111,7 +122,7 @@ func (a *App) ImportIPhoneBackup(ctx context.Context, backupDir string, opts IPh
 	if err != nil {
 		return res, err
 	}
-	groupMembers, participantsBySession, importedContacts, err := a.loadBackupGroupMembers(ctx, chatDB, contactNames)
+	groupMembers, participantsBySession, importedContacts, err := a.loadBackupGroupMembers(ctx, chatDB, canon, contactNames)
 	if err != nil {
 		return res, err
 	}
@@ -122,7 +133,7 @@ func (a *App) ImportIPhoneBackup(ctx context.Context, backupDir string, opts IPh
 		return res, err
 	}
 
-	sessions, importedChats, importedGroups, skippedStatusChats, err := a.importBackupChatSessions(ctx, chatDB, contactNames, groupInfos, opts)
+	sessions, importedChats, importedGroups, skippedStatusChats, err := a.importBackupChatSessions(ctx, chatDB, canon, contactNames, groupInfos, opts)
 	if err != nil {
 		return res, err
 	}
@@ -136,7 +147,7 @@ func (a *App) ImportIPhoneBackup(ctx context.Context, backupDir string, opts IPh
 	}
 	res.GroupParticipantsImported += participantsImported
 
-	messagesImported, mediaImported, starredImported, skippedStatusMessages, err := a.importBackupMessages(ctx, chatDB, absBackupDir, sessions, groupMembers, mediaItems, contactNames, opts)
+	messagesImported, mediaImported, starredImported, skippedStatusMessages, err := a.importBackupMessages(ctx, chatDB, absBackupDir, canon, sessions, groupMembers, mediaItems, contactNames, opts)
 	if err != nil {
 		return res, err
 	}
@@ -148,7 +159,7 @@ func (a *App) ImportIPhoneBackup(ctx context.Context, backupDir string, opts IPh
 	return res, nil
 }
 
-func (a *App) importBackupContacts(ctx context.Context, contactsDB *sql.DB, contactNames map[string]string) (int, error) {
+func (a *App) importBackupContacts(ctx context.Context, contactsDB *sql.DB, canon *backupImportCanonicalizer, contactNames map[string]string) (int, error) {
 	rows, err := contactsDB.QueryContext(ctx, `
 		SELECT COALESCE(ZWHATSAPPID,''),
 		       COALESCE(ZFULLNAME,''),
@@ -175,6 +186,10 @@ func (a *App) importBackupContacts(ctx context.Context, contactsDB *sql.DB, cont
 		jid := normalizeBackupContactJID(whatsappID, lid)
 		if jid == "" {
 			continue
+		}
+		jid, err = canon.CanonicalizeUserJID(ctx, jid)
+		if err != nil {
+			return imported, fmt.Errorf("canonicalize contact %s: %w", jid, err)
 		}
 		name := bestNonEmpty(fullName, businessName, givenName)
 		contactNames[jid] = bestNonEmpty(name, contactNames[jid])
@@ -220,7 +235,7 @@ func loadBackupGroupInfos(ctx context.Context, chatDB *sql.DB) (map[int64]backup
 	return out, nil
 }
 
-func (a *App) loadBackupGroupMembers(ctx context.Context, chatDB *sql.DB, contactNames map[string]string) (map[int64]backupGroupMember, map[int64][]store.GroupParticipant, int, error) {
+func (a *App) loadBackupGroupMembers(ctx context.Context, chatDB *sql.DB, canon *backupImportCanonicalizer, contactNames map[string]string) (map[int64]backupGroupMember, map[int64][]store.GroupParticipant, int, error) {
 	rows, err := chatDB.QueryContext(ctx, `
 		SELECT Z_PK, COALESCE(ZCHATSESSION,0), COALESCE(ZMEMBERJID,''), COALESCE(ZCONTACTNAME,''), COALESCE(ZFIRSTNAME,''), COALESCE(ZISADMIN,0)
 		FROM ZWAGROUPMEMBER
@@ -246,6 +261,10 @@ func (a *App) loadBackupGroupMembers(ctx context.Context, chatDB *sql.DB, contac
 		jid := normalizeBackupJID(memberJID)
 		if jid == "" {
 			continue
+		}
+		jid, err = canon.CanonicalizeUserJID(ctx, jid)
+		if err != nil {
+			return nil, nil, importedContacts, fmt.Errorf("canonicalize group member %s: %w", memberJID, err)
 		}
 		member := backupGroupMember{
 			SessionPK:   sessionPK,
@@ -305,7 +324,7 @@ func loadBackupMediaItems(ctx context.Context, chatDB *sql.DB) (map[int64]backup
 	return out, nil
 }
 
-func (a *App) importBackupChatSessions(ctx context.Context, chatDB *sql.DB, contactNames map[string]string, groupInfos map[int64]backupGroupInfo, opts IPhoneBackupImportOptions) (map[int64]backupChatSession, int, int, int, error) {
+func (a *App) importBackupChatSessions(ctx context.Context, chatDB *sql.DB, canon *backupImportCanonicalizer, contactNames map[string]string, groupInfos map[int64]backupGroupInfo, opts IPhoneBackupImportOptions) (map[int64]backupChatSession, int, int, int, error) {
 	rows, err := chatDB.QueryContext(ctx, `
 		SELECT Z_PK, COALESCE(ZCONTACTJID,''), COALESCE(ZPARTNERNAME,''), COALESCE(ZLASTMESSAGEDATE,0), COALESCE(ZGROUPINFO,0)
 		FROM ZWACHATSESSION
@@ -316,6 +335,8 @@ func (a *App) importBackupChatSessions(ctx context.Context, chatDB *sql.DB, cont
 	defer rows.Close()
 
 	sessions := make(map[int64]backupChatSession)
+	seenChats := make(map[string]bool)
+	seenGroups := make(map[string]bool)
 	var importedChats, importedGroups, skippedStatus int
 	for rows.Next() {
 		if err := ctx.Err(); err != nil {
@@ -330,6 +351,12 @@ func (a *App) importBackupChatSessions(ctx context.Context, chatDB *sql.DB, cont
 		jid := normalizeBackupJID(rawJID)
 		if jid == "" {
 			continue
+		}
+		if !isNonUserChatJID(jid) {
+			jid, err = canon.CanonicalizeUserJID(ctx, jid)
+			if err != nil {
+				return nil, importedChats, importedGroups, skippedStatus, fmt.Errorf("canonicalize chat %s: %w", rawJID, err)
+			}
 		}
 		isStatus := isStatusLikeJID(jid)
 		if isStatus && !opts.IncludeStatus {
@@ -351,14 +378,26 @@ func (a *App) importBackupChatSessions(ctx context.Context, chatDB *sql.DB, cont
 			GroupInfoPK:   groupInfoPK,
 			IsStatus:      isStatus,
 		}
-		importedChats++
+		if !seenChats[jid] {
+			seenChats[jid] = true
+			importedChats++
+		}
 		if kind == "group" {
 			g := groupInfos[pk]
 			ownerJID := bestNonEmpty(g.OwnerJID, g.CreatorJID)
+			if ownerJID != "" {
+				ownerJID, err = canon.CanonicalizeUserJID(ctx, ownerJID)
+				if err != nil {
+					return nil, importedChats, importedGroups, skippedStatus, fmt.Errorf("canonicalize group owner %s: %w", ownerJID, err)
+				}
+			}
 			if err := a.db.UpsertGroup(jid, name, ownerJID, g.CreatedAt); err != nil {
 				return nil, importedChats, importedGroups, skippedStatus, fmt.Errorf("upsert group %s: %w", jid, err)
 			}
-			importedGroups++
+			if !seenGroups[jid] {
+				seenGroups[jid] = true
+				importedGroups++
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -388,7 +427,7 @@ func (a *App) importBackupGroupParticipants(ctx context.Context, sessions map[in
 	return imported, nil
 }
 
-func (a *App) importBackupMessages(ctx context.Context, chatDB *sql.DB, backupDir string, sessions map[int64]backupChatSession, groupMembers map[int64]backupGroupMember, mediaItems map[int64]backupMediaItem, contactNames map[string]string, opts IPhoneBackupImportOptions) (int, int, int, int, error) {
+func (a *App) importBackupMessages(ctx context.Context, chatDB *sql.DB, backupDir string, canon *backupImportCanonicalizer, sessions map[int64]backupChatSession, groupMembers map[int64]backupGroupMember, mediaItems map[int64]backupMediaItem, contactNames map[string]string, opts IPhoneBackupImportOptions) (int, int, int, int, error) {
 	rows, err := chatDB.QueryContext(ctx, `
 		SELECT Z_PK,
 		       COALESCE(ZCHATSESSION,0),
@@ -436,6 +475,12 @@ func (a *App) importBackupMessages(ctx context.Context, chatDB *sql.DB, backupDi
 		senderJID := importedMessageSenderJID(session, member, normalizeBackupJID(fromJID), normalizeBackupJID(toJID), isFromMe != 0)
 		if senderJID == "" && session.Kind == "dm" && !isFromMeBool(isFromMe) {
 			senderJID = session.JID
+		}
+		if senderJID != "" && !isNonUserChatJID(senderJID) {
+			senderJID, err = canon.CanonicalizeUserJID(ctx, senderJID)
+			if err != nil {
+				return imported, mediaImported, starredImported, skippedStatus, fmt.Errorf("canonicalize sender %s: %w", senderJID, err)
+			}
 		}
 		senderName := bestNonEmpty(member.ContactName, member.FirstName, contactNames[senderJID], session.Name)
 		resolvedLocalPath := resolveBackupMediaPath(backupDir, media.LocalPath)
@@ -532,6 +577,11 @@ func normalizeBackupJID(s string) string {
 func isStatusLikeJID(jid string) bool {
 	jid = strings.ToLower(strings.TrimSpace(jid))
 	return jid == "status@broadcast" || strings.HasSuffix(jid, "@status")
+}
+
+func isNonUserChatJID(jid string) bool {
+	jid = strings.ToLower(strings.TrimSpace(jid))
+	return strings.HasSuffix(jid, "@g.us") || strings.HasSuffix(jid, "@broadcast") || strings.HasSuffix(jid, "@status") || strings.HasSuffix(jid, "@newsletter")
 }
 
 func detectBackupChatKind(jid string, hasGroupInfo bool) string {
@@ -688,3 +738,43 @@ func firstNonEmpty(values ...string) string {
 func bestNonEmpty(values ...string) string { return firstNonEmpty(values...) }
 
 func isFromMeBool(v int) bool { return v != 0 }
+
+func (r *backupImportCanonicalizer) CanonicalizeUserJID(ctx context.Context, jid string) (string, error) {
+	jid = normalizeBackupJID(jid)
+	if jid == "" || isNonUserChatJID(jid) {
+		return jid, nil
+	}
+	if canonical, ok := r.canonical[jid]; ok {
+		return canonical, nil
+	}
+	candidates, err := r.app.ResolveChatJIDCandidates(ctx, jid)
+	if err != nil || len(candidates) == 0 {
+		candidates = []string{jid}
+	}
+	canonical := normalizeBackupJID(candidates[0])
+	if canonical == "" {
+		canonical = jid
+	}
+	for _, candidate := range candidates {
+		candidate = normalizeBackupJID(candidate)
+		if candidate == "" {
+			continue
+		}
+		r.canonical[candidate] = canonical
+	}
+	for _, alt := range candidates[1:] {
+		alt = normalizeBackupJID(alt)
+		if alt == "" || alt == canonical {
+			continue
+		}
+		key := alt + "=>" + canonical
+		if r.merged[key] {
+			continue
+		}
+		if _, err := r.app.db.MergeChatIdentity(alt, canonical); err != nil {
+			return "", fmt.Errorf("merge duplicate identity %s -> %s: %w", alt, canonical, err)
+		}
+		r.merged[key] = true
+	}
+	return canonical, nil
+}
