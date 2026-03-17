@@ -945,6 +945,37 @@ func (d *DB) GetChat(jid string) (Chat, error) {
 	return c, nil
 }
 
+// ListChatsWithMessages returns all chats that have at least one message stored
+// locally, ordered by most recent message first. Pass limit=0 for all chats.
+func (d *DB) ListChatsWithMessages(limit int) ([]Chat, error) {
+	q := `
+		SELECT c.jid, c.kind, COALESCE(c.name,''), COALESCE(c.last_message_ts,0)
+		FROM chats c
+		WHERE EXISTS (SELECT 1 FROM messages m WHERE m.chat_jid = c.jid)
+		ORDER BY c.last_message_ts DESC`
+	var args []interface{}
+	if limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := d.sql.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Chat
+	for rows.Next() {
+		var c Chat
+		var ts int64
+		if err := rows.Scan(&c.JID, &c.Kind, &c.Name, &ts); err != nil {
+			return nil, err
+		}
+		c.LastMessageTS = fromUnix(ts)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 func (d *DB) SearchContacts(query string, limit int) ([]Contact, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, fmt.Errorf("query is required")
