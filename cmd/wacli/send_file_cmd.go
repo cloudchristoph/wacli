@@ -16,6 +16,7 @@ func newSendFileCmd(flags *rootFlags) *cobra.Command {
 	var filename string
 	var caption string
 	var mimeOverride string
+	var ptt bool
 
 	cmd := &cobra.Command{
 		Use:   "file",
@@ -46,7 +47,7 @@ func newSendFileCmd(flags *rootFlags) *cobra.Command {
 				return err
 			}
 
-			msgID, meta, err := sendFile(ctx, a, toJID, filePath, filename, caption, mimeOverride)
+			msgID, meta, err := sendFile(ctx, a, toJID, filePath, filename, caption, mimeOverride, ptt)
 			if err != nil {
 				return err
 			}
@@ -69,5 +70,6 @@ func newSendFileCmd(flags *rootFlags) *cobra.Command {
 	cmd.Flags().StringVar(&filename, "filename", "", "display name for the file (defaults to basename of --file)")
 	cmd.Flags().StringVar(&caption, "caption", "", "caption (images/videos/documents)")
 	cmd.Flags().StringVar(&mimeOverride, "mime", "", "override detected mime type")
+	cmd.Flags().BoolVar(&ptt, "ptt", false, "send audio as voice message (push-to-talk)")
 	return cmd
 }
