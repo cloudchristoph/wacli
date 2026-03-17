@@ -431,6 +431,8 @@ type UpsertMessageParams struct {
 	FileSHA256    []byte
 	FileEncSHA256 []byte
 	FileLength    uint64
+	LocalPath     string
+	DownloadedAt  time.Time
 }
 
 func (d *DB) UpsertMessage(p UpsertMessageParams) error {
@@ -438,8 +440,8 @@ func (d *DB) UpsertMessage(p UpsertMessageParams) error {
 		INSERT INTO messages(
 			chat_jid, chat_name, msg_id, sender_jid, sender_name, ts, from_me, text, display_text,
 			media_type, media_caption, filename, mime_type, direct_path,
-			media_key, file_sha256, file_enc_sha256, file_length
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			media_key, file_sha256, file_enc_sha256, file_length, local_path, downloaded_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(chat_jid, msg_id) DO UPDATE SET
 			chat_name=COALESCE(NULLIF(excluded.chat_name,''), messages.chat_name),
 			sender_jid=excluded.sender_jid,
@@ -456,10 +458,12 @@ func (d *DB) UpsertMessage(p UpsertMessageParams) error {
 			media_key=CASE WHEN excluded.media_key IS NOT NULL AND length(excluded.media_key)>0 THEN excluded.media_key ELSE messages.media_key END,
 			file_sha256=CASE WHEN excluded.file_sha256 IS NOT NULL AND length(excluded.file_sha256)>0 THEN excluded.file_sha256 ELSE messages.file_sha256 END,
 			file_enc_sha256=CASE WHEN excluded.file_enc_sha256 IS NOT NULL AND length(excluded.file_enc_sha256)>0 THEN excluded.file_enc_sha256 ELSE messages.file_enc_sha256 END,
-			file_length=CASE WHEN excluded.file_length>0 THEN excluded.file_length ELSE messages.file_length END
+			file_length=CASE WHEN excluded.file_length>0 THEN excluded.file_length ELSE messages.file_length END,
+			local_path=COALESCE(NULLIF(excluded.local_path,''), messages.local_path),
+			downloaded_at=CASE WHEN excluded.downloaded_at>0 THEN excluded.downloaded_at ELSE messages.downloaded_at END
 	`, p.ChatJID, nullIfEmpty(p.ChatName), p.MsgID, nullIfEmpty(p.SenderJID), nullIfEmpty(p.SenderName), unix(p.Timestamp), boolToInt(p.FromMe), nullIfEmpty(p.Text), nullIfEmpty(p.DisplayText),
 		nullIfEmpty(p.MediaType), nullIfEmpty(p.MediaCaption), nullIfEmpty(p.Filename), nullIfEmpty(p.MimeType), nullIfEmpty(p.DirectPath),
-		p.MediaKey, p.FileSHA256, p.FileEncSHA256, int64(p.FileLength),
+		p.MediaKey, p.FileSHA256, p.FileEncSHA256, int64(p.FileLength), nullIfEmpty(p.LocalPath), unix(p.DownloadedAt),
 	)
 	return err
 }
