@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steipete/wacli/internal/app"
 	"github.com/steipete/wacli/internal/out"
 )
 
@@ -18,6 +19,7 @@ func newChatsCmd(flags *rootFlags) *cobra.Command {
 	}
 	cmd.AddCommand(newChatsListCmd(flags))
 	cmd.AddCommand(newChatsShowCmd(flags))
+	cmd.AddCommand(newChatsConsolidateLIDCmd(flags))
 	return cmd
 }
 
@@ -93,5 +95,54 @@ func newChatsShowCmd(flags *rootFlags) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&jid, "jid", "", "chat JID")
+	return cmd
+}
+
+func newChatsConsolidateLIDCmd(flags *rootFlags) *cobra.Command {
+	var dryRun bool
+	var limit int
+
+	cmd := &cobra.Command{
+		Use:   "consolidate-lid",
+		Short: "Consolidate @lid chats into phone JIDs using session mappings (lossless)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := withTimeout(context.Background(), flags)
+			defer cancel()
+
+			a, lk, err := newApp(ctx, flags, false, false)
+			if err != nil {
+				return err
+			}
+			defer closeApp(a, lk)
+
+			res, err := a.ConsolidateLIDChats(ctx, app.ConsolidateLIDOptions{
+				DryRun: dryRun,
+				Limit:  limit,
+			})
+			if err != nil {
+				return err
+			}
+
+			if flags.asJSON {
+				return out.WriteJSON(os.Stdout, res)
+			}
+
+			if dryRun {
+				fmt.Fprintf(os.Stdout, "Dry-run: %d mappings found, %d candidates.\n", res.MappingsFound, res.MappingsTried)
+				for _, p := range res.Pairs {
+					fmt.Fprintf(os.Stdout, "  %s\n", p)
+				}
+				return nil
+			}
+
+			fmt.Fprintf(os.Stdout,
+				"Consolidation complete: merged %d chats, moved %d messages (%d mappings found, %d tried).\n",
+				res.ChatsMerged, res.MessagesMoved, res.MappingsFound, res.MappingsTried)
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolVar(&dryRun, "dry-run", true, "show candidate merges without modifying data")
+	cmd.Flags().IntVar(&limit, "limit", 0, "max number of mappings to process (0 = all)")
 	return cmd
 }

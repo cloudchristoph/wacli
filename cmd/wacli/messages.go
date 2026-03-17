@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"strings"
@@ -63,15 +64,35 @@ func newMessagesListCmd(flags *rootFlags) *cobra.Command {
 				before = &t
 			}
 
-			msgs, err := a.DB().ListMessages(store.ListMessagesParams{
-				ChatJID: chat,
-				Limit:   limit,
-				After:   after,
-				Before:  before,
-				Starred: starred,
-			})
+			resolvedChat := chat
+			var candidates []string
+			if strings.TrimSpace(chat) != "" {
+				candidates, _ = a.ResolveChatJIDCandidates(ctx, chat)
+				if len(candidates) > 0 {
+					resolvedChat = candidates[0]
+					if resolvedChat != chat {
+						fmt.Fprintf(os.Stderr, "Note: resolved --chat %s -> %s\n", chat, resolvedChat)
+					}
+				}
+			}
+
+			msgs, err := a.DB().ListMessages(store.ListMessagesParams{ChatJID: resolvedChat, Limit: limit, After: after, Before: before, Starred: starred})
 			if err != nil {
 				return err
+			}
+			if len(msgs) == 0 && len(candidates) > 1 {
+				for _, alt := range candidates[1:] {
+					altMsgs, altErr := a.DB().ListMessages(store.ListMessagesParams{ChatJID: alt, Limit: limit, After: after, Before: before, Starred: starred})
+					if altErr != nil {
+						continue
+					}
+					if len(altMsgs) > 0 {
+						resolvedChat = alt
+						msgs = altMsgs
+						fmt.Fprintf(os.Stderr, "Note: resolved --chat %s -> %s\n", chat, alt)
+						break
+					}
+				}
 			}
 
 			if flags.asJSON {
@@ -160,18 +181,35 @@ func newMessagesSearchCmd(flags *rootFlags) *cobra.Command {
 				before = &t
 			}
 
-			msgs, err := a.DB().SearchMessages(store.SearchMessagesParams{
-				Query:   args[0],
-				ChatJID: chat,
-				From:    from,
-				Limit:   limit,
-				After:   after,
-				Before:  before,
-				Type:    msgType,
-				Starred: starred,
-			})
+			resolvedChat := chat
+			var candidates []string
+			if strings.TrimSpace(chat) != "" {
+				candidates, _ = a.ResolveChatJIDCandidates(ctx, chat)
+				if len(candidates) > 0 {
+					resolvedChat = candidates[0]
+					if resolvedChat != chat {
+						fmt.Fprintf(os.Stderr, "Note: resolved --chat %s -> %s\n", chat, resolvedChat)
+					}
+				}
+			}
+
+			msgs, err := a.DB().SearchMessages(store.SearchMessagesParams{Query: args[0], ChatJID: resolvedChat, From: from, Limit: limit, After: after, Before: before, Type: msgType, Starred: starred})
 			if err != nil {
 				return err
+			}
+			if len(msgs) == 0 && len(candidates) > 1 {
+				for _, alt := range candidates[1:] {
+					altMsgs, altErr := a.DB().SearchMessages(store.SearchMessagesParams{Query: args[0], ChatJID: alt, From: from, Limit: limit, After: after, Before: before, Type: msgType, Starred: starred})
+					if altErr != nil {
+						continue
+					}
+					if len(altMsgs) > 0 {
+						resolvedChat = alt
+						msgs = altMsgs
+						fmt.Fprintf(os.Stderr, "Note: resolved --chat %s -> %s\n", chat, alt)
+						break
+					}
+				}
 			}
 
 			if flags.asJSON {
@@ -246,7 +284,28 @@ func newMessagesShowCmd(flags *rootFlags) *cobra.Command {
 			}
 			defer closeApp(a, lk)
 
-			m, err := a.DB().GetMessage(chat, id)
+			resolvedChat := chat
+			candidates, _ := a.ResolveChatJIDCandidates(ctx, chat)
+			if len(candidates) > 0 {
+				resolvedChat = candidates[0]
+				if resolvedChat != chat {
+					fmt.Fprintf(os.Stderr, "Note: resolved --chat %s -> %s\n", chat, resolvedChat)
+				}
+			}
+
+			m, err := a.DB().GetMessage(resolvedChat, id)
+			if err != nil && err == sql.ErrNoRows && len(candidates) > 1 {
+				for _, alt := range candidates[1:] {
+					altMsg, altErr := a.DB().GetMessage(alt, id)
+					if altErr == nil {
+						resolvedChat = alt
+						m = altMsg
+						fmt.Fprintf(os.Stderr, "Note: resolved --chat %s -> %s\n", chat, alt)
+						err = nil
+						break
+					}
+				}
+			}
 			if err != nil {
 				return err
 			}
@@ -302,7 +361,28 @@ func newMessagesContextCmd(flags *rootFlags) *cobra.Command {
 			}
 			defer closeApp(a, lk)
 
-			msgs, err := a.DB().MessageContext(chat, id, before, after)
+			resolvedChat := chat
+			candidates, _ := a.ResolveChatJIDCandidates(ctx, chat)
+			if len(candidates) > 0 {
+				resolvedChat = candidates[0]
+				if resolvedChat != chat {
+					fmt.Fprintf(os.Stderr, "Note: resolved --chat %s -> %s\n", chat, resolvedChat)
+				}
+			}
+
+			msgs, err := a.DB().MessageContext(resolvedChat, id, before, after)
+			if err != nil && err == sql.ErrNoRows && len(candidates) > 1 {
+				for _, alt := range candidates[1:] {
+					altMsgs, altErr := a.DB().MessageContext(alt, id, before, after)
+					if altErr == nil && len(altMsgs) > 0 {
+						resolvedChat = alt
+						msgs = altMsgs
+						fmt.Fprintf(os.Stderr, "Note: resolved --chat %s -> %s\n", chat, alt)
+						err = nil
+						break
+					}
+				}
+			}
 			if err != nil {
 				return err
 			}

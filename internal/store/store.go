@@ -945,6 +945,150 @@ func (d *DB) GetChat(jid string) (Chat, error) {
 	return c, nil
 }
 
+// MergeChatIdentity moves all data from fromJID into toJID without dropping
+// messages. Existing rows in toJID are preserved and enriched on conflict.
+// Returns the number of message rows moved from fromJID.
+func (d *DB) MergeChatIdentity(fromJID, toJID string) (int64, error) {
+	fromJID = strings.TrimSpace(fromJID)
+	toJID = strings.TrimSpace(toJID)
+	if fromJID == "" || toJID == "" || fromJID == toJID {
+		return 0, nil
+	}
+
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// Ensure destination chat exists and keep best metadata.
+	if _, err = tx.Exec(`
+		INSERT INTO chats(jid, kind, name, last_message_ts)
+		SELECT ?,
+		       CASE WHEN kind = 'unknown' THEN 'dm' ELSE kind END,
+		       name,
+		       last_message_ts
+		FROM chats WHERE jid = ?
+		ON CONFLICT(jid) DO UPDATE SET
+			kind=CASE WHEN chats.kind='unknown' AND excluded.kind!='unknown' THEN excluded.kind ELSE chats.kind END,
+			name=CASE WHEN (COALESCE(chats.name,'')='') AND COALESCE(excluded.name,'')!='' THEN excluded.name ELSE chats.name END,
+			last_message_ts=CASE WHEN COALESCE(excluded.last_message_ts,0) > COALESCE(chats.last_message_ts,0) THEN excluded.last_message_ts ELSE chats.last_message_ts END
+	`, toJID, fromJID); err != nil {
+		return 0, err
+	}
+
+	// Move messages with conflict-safe upsert into destination chat.
+	if _, err = tx.Exec(`
+		INSERT INTO messages(
+			chat_jid, chat_name, msg_id, sender_jid, sender_name, ts, from_me, text, display_text,
+			media_type, media_caption, filename, mime_type, direct_path,
+			media_key, file_sha256, file_enc_sha256, file_length, local_path, downloaded_at
+		)
+		SELECT ?, chat_name, msg_id, sender_jid, sender_name, ts, from_me, text, display_text,
+		       media_type, media_caption, filename, mime_type, direct_path,
+		       media_key, file_sha256, file_enc_sha256, file_length, local_path, downloaded_at
+		FROM messages
+		WHERE chat_jid = ?
+		ON CONFLICT(chat_jid, msg_id) DO UPDATE SET
+			chat_name=COALESCE(NULLIF(messages.chat_name,''), NULLIF(excluded.chat_name,''), messages.chat_name),
+			sender_jid=COALESCE(NULLIF(messages.sender_jid,''), excluded.sender_jid),
+			sender_name=COALESCE(NULLIF(messages.sender_name,''), NULLIF(excluded.sender_name,''), messages.sender_name),
+			ts=CASE WHEN excluded.ts < messages.ts THEN excluded.ts ELSE messages.ts END,
+			from_me=CASE WHEN messages.from_me=1 OR excluded.from_me=1 THEN 1 ELSE 0 END,
+			text=CASE WHEN COALESCE(length(messages.text),0) >= COALESCE(length(excluded.text),0) THEN messages.text ELSE excluded.text END,
+			display_text=CASE WHEN COALESCE(length(messages.display_text),0) >= COALESCE(length(excluded.display_text),0) THEN messages.display_text ELSE excluded.display_text END,
+			media_type=COALESCE(NULLIF(messages.media_type,''), excluded.media_type),
+			media_caption=COALESCE(NULLIF(messages.media_caption,''), excluded.media_caption),
+			filename=COALESCE(NULLIF(messages.filename,''), excluded.filename),
+			mime_type=COALESCE(NULLIF(messages.mime_type,''), excluded.mime_type),
+			direct_path=COALESCE(NULLIF(messages.direct_path,''), excluded.direct_path),
+			media_key=CASE WHEN messages.media_key IS NOT NULL AND length(messages.media_key)>0 THEN messages.media_key ELSE excluded.media_key END,
+			file_sha256=CASE WHEN messages.file_sha256 IS NOT NULL AND length(messages.file_sha256)>0 THEN messages.file_sha256 ELSE excluded.file_sha256 END,
+			file_enc_sha256=CASE WHEN messages.file_enc_sha256 IS NOT NULL AND length(messages.file_enc_sha256)>0 THEN messages.file_enc_sha256 ELSE excluded.file_enc_sha256 END,
+			file_length=CASE WHEN COALESCE(messages.file_length,0) > 0 THEN messages.file_length ELSE excluded.file_length END,
+			local_path=COALESCE(NULLIF(messages.local_path,''), excluded.local_path),
+			downloaded_at=CASE WHEN COALESCE(messages.downloaded_at,0) > 0 THEN messages.downloaded_at ELSE excluded.downloaded_at END
+	`, toJID, fromJID); err != nil {
+		return 0, err
+	}
+
+	res, err := tx.Exec(`DELETE FROM messages WHERE chat_jid = ?`, fromJID)
+	if err != nil {
+		return 0, err
+	}
+	moved, _ := res.RowsAffected()
+
+	if _, err = tx.Exec(`
+		INSERT INTO starred(chat_jid, sender_jid, msg_id, starred_at)
+		SELECT ?, sender_jid, msg_id, starred_at
+		FROM starred
+		WHERE chat_jid = ?
+		ON CONFLICT(chat_jid, msg_id) DO UPDATE SET
+			sender_jid=COALESCE(NULLIF(starred.sender_jid,''), excluded.sender_jid),
+			starred_at=CASE WHEN excluded.starred_at < starred.starred_at THEN excluded.starred_at ELSE starred.starred_at END
+	`, toJID, fromJID); err != nil {
+		return 0, err
+	}
+	if _, err = tx.Exec(`DELETE FROM starred WHERE chat_jid = ?`, fromJID); err != nil {
+		return 0, err
+	}
+
+	if _, err = tx.Exec(`
+		INSERT INTO contacts(jid, phone, push_name, full_name, first_name, business_name, updated_at)
+		SELECT ?, phone, push_name, full_name, first_name, business_name, updated_at
+		FROM contacts
+		WHERE jid = ?
+		ON CONFLICT(jid) DO UPDATE SET
+			phone=COALESCE(NULLIF(contacts.phone,''), excluded.phone),
+			push_name=COALESCE(NULLIF(contacts.push_name,''), excluded.push_name),
+			full_name=COALESCE(NULLIF(contacts.full_name,''), excluded.full_name),
+			first_name=COALESCE(NULLIF(contacts.first_name,''), excluded.first_name),
+			business_name=COALESCE(NULLIF(contacts.business_name,''), excluded.business_name),
+			updated_at=CASE WHEN excluded.updated_at > contacts.updated_at THEN excluded.updated_at ELSE contacts.updated_at END
+	`, toJID, fromJID); err != nil {
+		return 0, err
+	}
+	if _, err = tx.Exec(`DELETE FROM contacts WHERE jid = ?`, fromJID); err != nil {
+		return 0, err
+	}
+
+	if _, err = tx.Exec(`
+		INSERT INTO contact_aliases(jid, alias, notes, updated_at)
+		SELECT ?, alias, notes, updated_at
+		FROM contact_aliases
+		WHERE jid = ?
+		ON CONFLICT(jid) DO UPDATE SET
+			alias=CASE WHEN COALESCE(contact_aliases.alias,'')='' AND COALESCE(excluded.alias,'')!='' THEN excluded.alias ELSE contact_aliases.alias END,
+			notes=CASE WHEN COALESCE(contact_aliases.notes,'')='' AND COALESCE(excluded.notes,'')!='' THEN excluded.notes ELSE contact_aliases.notes END,
+			updated_at=CASE WHEN excluded.updated_at > contact_aliases.updated_at THEN excluded.updated_at ELSE contact_aliases.updated_at END
+	`, toJID, fromJID); err != nil {
+		return 0, err
+	}
+	if _, err = tx.Exec(`DELETE FROM contact_aliases WHERE jid = ?`, fromJID); err != nil {
+		return 0, err
+	}
+
+	if _, err = tx.Exec(`INSERT OR IGNORE INTO contact_tags(jid, tag, updated_at) SELECT ?, tag, updated_at FROM contact_tags WHERE jid = ?`, toJID, fromJID); err != nil {
+		return 0, err
+	}
+	if _, err = tx.Exec(`DELETE FROM contact_tags WHERE jid = ?`, fromJID); err != nil {
+		return 0, err
+	}
+
+	if _, err = tx.Exec(`DELETE FROM chats WHERE jid = ?`, fromJID); err != nil {
+		return 0, err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return moved, nil
+}
+
 // ListChatsWithMessages returns all chats that have at least one message stored
 // locally, ordered by most recent message first. Pass limit=0 for all chats.
 func (d *DB) ListChatsWithMessages(limit int) ([]Chat, error) {

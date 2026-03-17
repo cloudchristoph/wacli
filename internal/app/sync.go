@@ -222,7 +222,7 @@ func chatKind(chat types.JID) string {
 	if chat.IsBroadcastList() {
 		return "broadcast"
 	}
-	if chat.Server == types.DefaultUserServer {
+	if chat.Server == types.DefaultUserServer || chat.Server == types.HiddenUserServer {
 		return "dm"
 	}
 	return "unknown"
