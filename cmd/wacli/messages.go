@@ -100,7 +100,7 @@ func newMessagesListCmd(flags *rootFlags) *cobra.Command {
 					m.Timestamp.Local().Format("2006-01-02 15:04:05"),
 					truncate(chatLabel, 24),
 					truncate(from, 18),
-					truncate(m.MsgID, 14),
+					truncateForDisplay(m.MsgID, 14, flags.fullOutput),
 					truncate(text, 80),
 				)
 			}
@@ -197,7 +197,7 @@ func newMessagesSearchCmd(flags *rootFlags) *cobra.Command {
 					m.Timestamp.Local().Format("2006-01-02 15:04:05"),
 					truncate(chatLabel, 24),
 					truncate(fromLabel, 18),
-					truncate(m.MsgID, 14),
+					truncateForDisplay(m.MsgID, 14, flags.fullOutput),
 					truncate(match, 90),
 				)
 			}
@@ -318,7 +318,7 @@ func newMessagesContextCmd(flags *rootFlags) *cobra.Command {
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
 					m.Timestamp.Local().Format("2006-01-02 15:04:05"),
 					truncate(from, 18),
-					truncate(m.MsgID, 14),
+					truncateForDisplay(m.MsgID, 14, flags.fullOutput),
 					truncate(line, 100),
 				)
 			}
