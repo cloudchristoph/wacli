@@ -183,6 +183,49 @@ func (c *Client) SendText(ctx context.Context, to types.JID, text string) (types
 	return resp.ID, nil
 }
 
+func strPtr(s string) *string {
+	return &s
+}
+
+// SendTextReply sends a quoted-reply to an existing message.
+//
+// Notes:
+// - replyToID must be the stanza/message id of the message being replied to.
+// - participantJID is required for group replies (sender of the quoted message).
+// - quoted is optional but recommended; WhatsApp clients display a better quote when present.
+func (c *Client) SendTextReply(ctx context.Context, to types.JID, text string, replyToID string, participantJID *types.JID, quoted *waProto.Message) (types.MessageID, error) {
+	c.mu.Lock()
+	cli := c.client
+	c.mu.Unlock()
+	if cli == nil || !cli.IsConnected() {
+		return "", fmt.Errorf("not connected")
+	}
+	if strings.TrimSpace(replyToID) == "" {
+		return "", fmt.Errorf("replyToID is required")
+	}
+	// In groups, WhatsApp requires the quoted message sender (participant) to avoid "replying to you" bugs.
+	if to.Server == types.GroupServer {
+		if participantJID == nil || participantJID.IsEmpty() {
+			return "", fmt.Errorf("participantJID is required for group replies")
+		}
+	}
+
+	ctxInfo := &waProto.ContextInfo{StanzaID: strPtr(replyToID)}
+	if participantJID != nil && !participantJID.IsEmpty() {
+		ctxInfo.Participant = strPtr(participantJID.String())
+	}
+	if quoted != nil {
+		ctxInfo.QuotedMessage = quoted
+	}
+
+	msg := &waProto.Message{ExtendedTextMessage: &waProto.ExtendedTextMessage{Text: strPtr(text), ContextInfo: ctxInfo}}
+	resp, err := cli.SendMessage(ctx, to, msg)
+	if err != nil {
+		return "", err
+	}
+	return resp.ID, nil
+}
+
 func (c *Client) SendProtoMessage(ctx context.Context, to types.JID, msg *waProto.Message) (types.MessageID, error) {
 	c.mu.Lock()
 	cli := c.client

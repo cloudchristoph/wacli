@@ -208,6 +208,10 @@ func (f *fakeWA) SendText(ctx context.Context, to types.JID, text string) (types
 	return types.MessageID("msgid"), nil
 }
 
+func (f *fakeWA) SendTextReply(ctx context.Context, to types.JID, text string, replyToID string, participantJID *types.JID, quoted *waProto.Message) (types.MessageID, error) {
+	return types.MessageID("msgid"), nil
+}
+
 func (f *fakeWA) SendProtoMessage(ctx context.Context, to types.JID, msg *waProto.Message) (types.MessageID, error) {
 	return types.MessageID("msgid"), nil
 }
