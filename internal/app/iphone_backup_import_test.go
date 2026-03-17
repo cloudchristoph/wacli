@@ -80,8 +80,22 @@ func TestImportIPhoneBackup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetMediaDownloadInfo: %v", err)
 	}
-	if info.LocalPath != mediaPath {
-		t.Fatalf("expected resolved media path %q, got %q", mediaPath, info.LocalPath)
+	expectedMediaPath, err := a.ResolveMediaOutputPath(info, "")
+	if err != nil {
+		t.Fatalf("ResolveMediaOutputPath: %v", err)
+	}
+	if info.LocalPath != expectedMediaPath {
+		t.Fatalf("expected standardized media path %q, got %q", expectedMediaPath, info.LocalPath)
+	}
+	if _, err := os.Stat(info.LocalPath); err != nil {
+		t.Fatalf("expected copied media file at %q: %v", info.LocalPath, err)
+	}
+	body, err := os.ReadFile(info.LocalPath)
+	if err != nil {
+		t.Fatalf("ReadFile copied media: %v", err)
+	}
+	if string(body) != "jpg" {
+		t.Fatalf("expected copied media content to match source, got %q", string(body))
 	}
 
 	starred, err := a.DB().ListStarred("", time.Time{})
@@ -113,6 +127,72 @@ func TestImportIPhoneBackup(t *testing.T) {
 	}
 	if countBefore != countAfter {
 		t.Fatalf("expected idempotent import, before=%d after=%d", countBefore, countAfter)
+	}
+}
+
+func TestImportIPhoneBackupMigratesLegacyMediaLocalPath(t *testing.T) {
+	ctx := context.Background()
+	backupDir := t.TempDir()
+	chatDBPath := filepath.Join(backupDir, "ChatStorage.sqlite")
+	contactsDBPath := filepath.Join(backupDir, "ContactsV2.sqlite")
+	seedBackupDatabases(t, chatDBPath, contactsDBPath)
+
+	legacyDir := t.TempDir()
+	legacyPath := filepath.Join(legacyDir, "legacy-photo.jpg")
+	if err := os.WriteFile(legacyPath, []byte("legacy-bytes"), 0o644); err != nil {
+		t.Fatalf("WriteFile legacyPath: %v", err)
+	}
+
+	appDir := t.TempDir()
+	a, err := New(Options{StoreDir: appDir, AllowUnauthed: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer a.Close()
+
+	if err := a.DB().UpsertChat("120363000000000000@g.us", "group", "Project Team", time.Now().UTC()); err != nil {
+		t.Fatalf("UpsertChat group: %v", err)
+	}
+	if err := a.DB().UpsertMessage(store.UpsertMessageParams{
+		ChatJID:      "120363000000000000@g.us",
+		ChatName:     "Project Team",
+		MsgID:        "ios-backup-101",
+		SenderJID:    "491111111111@s.whatsapp.net",
+		SenderName:   "Bob Builder",
+		Timestamp:    time.Now().UTC().Add(-time.Hour),
+		MediaType:    "image",
+		Filename:     "photo.jpg",
+		MimeType:     "image/jpeg",
+		LocalPath:    legacyPath,
+		DownloadedAt: time.Now().UTC().Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("UpsertMessage preexisting media: %v", err)
+	}
+
+	if _, err := a.ImportIPhoneBackup(ctx, backupDir, IPhoneBackupImportOptions{}); err != nil {
+		t.Fatalf("ImportIPhoneBackup: %v", err)
+	}
+
+	info, err := a.DB().GetMediaDownloadInfo("120363000000000000@g.us", "ios-backup-101")
+	if err != nil {
+		t.Fatalf("GetMediaDownloadInfo: %v", err)
+	}
+	if info.LocalPath == legacyPath {
+		t.Fatalf("expected legacy local_path to be migrated away, still %q", info.LocalPath)
+	}
+	expectedMediaPath, err := a.ResolveMediaOutputPath(info, "")
+	if err != nil {
+		t.Fatalf("ResolveMediaOutputPath: %v", err)
+	}
+	if info.LocalPath != expectedMediaPath {
+		t.Fatalf("expected standardized media path %q, got %q", expectedMediaPath, info.LocalPath)
+	}
+	body, err := os.ReadFile(info.LocalPath)
+	if err != nil {
+		t.Fatalf("ReadFile migrated media: %v", err)
+	}
+	if string(body) != "legacy-bytes" {
+		t.Fatalf("expected migrated media content from legacy source, got %q", string(body))
 	}
 }
 
@@ -182,6 +262,73 @@ func TestImportIPhoneBackupMergesExistingAlternateChatIdentity(t *testing.T) {
 	}
 	if count != 3 {
 		t.Fatalf("expected 3 total messages after merge+import, got %d", count)
+	}
+}
+
+func TestImportIPhoneBackupMigrateMediaPathsOnly(t *testing.T) {
+	ctx := context.Background()
+	legacyDir := t.TempDir()
+	legacyPath := filepath.Join(legacyDir, "legacy-only-photo.jpg")
+	if err := os.WriteFile(legacyPath, []byte("legacy-only-bytes"), 0o644); err != nil {
+		t.Fatalf("WriteFile legacyPath: %v", err)
+	}
+
+	appDir := t.TempDir()
+	a, err := New(Options{StoreDir: appDir, AllowUnauthed: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer a.Close()
+
+	chatJID := "491234567890@s.whatsapp.net"
+	msgID := "legacy-only-msg"
+	if err := a.DB().UpsertChat(chatJID, "dm", "Legacy Only", time.Now().UTC()); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	if err := a.DB().UpsertMessage(store.UpsertMessageParams{
+		ChatJID:      chatJID,
+		ChatName:     "Legacy Only",
+		MsgID:        msgID,
+		SenderJID:    chatJID,
+		SenderName:   "Legacy Only",
+		Timestamp:    time.Now().UTC(),
+		MediaType:    "image",
+		Filename:     "legacy-only-photo.jpg",
+		MimeType:     "image/jpeg",
+		LocalPath:    legacyPath,
+		DownloadedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("UpsertMessage: %v", err)
+	}
+
+	res, err := a.ImportIPhoneBackup(ctx, "", IPhoneBackupImportOptions{MigrateMediaPathsOnly: true})
+	if err != nil {
+		t.Fatalf("ImportIPhoneBackup migrate-only: %v", err)
+	}
+	if res.MediaPathsChecked != 1 || res.MediaPathsMigrated != 1 || res.MediaPathsMissing != 0 {
+		t.Fatalf("unexpected migrate-only result: %+v", res)
+	}
+
+	info, err := a.DB().GetMediaDownloadInfo(chatJID, msgID)
+	if err != nil {
+		t.Fatalf("GetMediaDownloadInfo: %v", err)
+	}
+	if info.LocalPath == legacyPath {
+		t.Fatalf("expected migrated local path, still legacy: %q", info.LocalPath)
+	}
+	expectedMediaPath, err := a.ResolveMediaOutputPath(info, "")
+	if err != nil {
+		t.Fatalf("ResolveMediaOutputPath: %v", err)
+	}
+	if info.LocalPath != expectedMediaPath {
+		t.Fatalf("expected standardized media path %q, got %q", expectedMediaPath, info.LocalPath)
+	}
+	body, err := os.ReadFile(info.LocalPath)
+	if err != nil {
+		t.Fatalf("ReadFile migrated media: %v", err)
+	}
+	if string(body) != "legacy-only-bytes" {
+		t.Fatalf("expected migrated media content, got %q", string(body))
 	}
 }
 

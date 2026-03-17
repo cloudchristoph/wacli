@@ -23,13 +23,14 @@ func newImportCmd(flags *rootFlags) *cobra.Command {
 func newImportIPhoneBackupCmd(flags *rootFlags) *cobra.Command {
 	var path string
 	var includeStatus bool
+	var migrateMediaPathsOnly bool
 
 	cmd := &cobra.Command{
 		Use:     "iphone-backup",
 		Aliases: []string{"ios-backup"},
 		Short:   "Import chats, contacts, groups, and messages from an extracted iPhone WhatsApp backup",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if strings.TrimSpace(path) == "" {
+			if !migrateMediaPathsOnly && strings.TrimSpace(path) == "" {
 				return fmt.Errorf("--path is required")
 			}
 
@@ -42,13 +43,24 @@ func newImportIPhoneBackupCmd(flags *rootFlags) *cobra.Command {
 			}
 			defer closeApp(a, lk)
 
-			res, err := a.ImportIPhoneBackup(ctx, path, app.IPhoneBackupImportOptions{IncludeStatus: includeStatus})
+			res, err := a.ImportIPhoneBackup(ctx, path, app.IPhoneBackupImportOptions{
+				IncludeStatus:         includeStatus,
+				MigrateMediaPathsOnly: migrateMediaPathsOnly,
+			})
 			if err != nil {
 				return err
 			}
 
 			if flags.asJSON {
 				return out.WriteJSON(os.Stdout, res)
+			}
+
+			if migrateMediaPathsOnly {
+				fmt.Fprintf(os.Stdout, "Migrated media paths to wacli standard layout\n")
+				fmt.Fprintf(os.Stdout, "  Checked: %d\n", res.MediaPathsChecked)
+				fmt.Fprintf(os.Stdout, "  Migrated: %d\n", res.MediaPathsMigrated)
+				fmt.Fprintf(os.Stdout, "  Skipped missing source/target: %d\n", res.MediaPathsMissing)
+				return nil
 			}
 
 			fmt.Fprintf(os.Stdout, "Imported iPhone backup from %s\n", res.BackupPath)
@@ -68,5 +80,6 @@ func newImportIPhoneBackupCmd(flags *rootFlags) *cobra.Command {
 
 	cmd.Flags().StringVar(&path, "path", "", "path to extracted WhatsApp iPhone backup folder")
 	cmd.Flags().BoolVar(&includeStatus, "include-status", false, "include WhatsApp status/broadcast threads")
+	cmd.Flags().BoolVar(&migrateMediaPathsOnly, "migrate-media-paths-only", false, "migrate existing local media paths to the wacli standard media layout without importing backup data")
 	return cmd
 }

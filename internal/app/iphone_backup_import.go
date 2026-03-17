@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"mime"
 	"os"
 	"path/filepath"
@@ -15,7 +16,8 @@ import (
 )
 
 type IPhoneBackupImportOptions struct {
-	IncludeStatus bool
+	IncludeStatus         bool
+	MigrateMediaPathsOnly bool
 }
 
 type IPhoneBackupImportResult struct {
@@ -29,6 +31,9 @@ type IPhoneBackupImportResult struct {
 	MediaMessagesImported     int    `json:"media_messages_imported"`
 	SkippedStatusChats        int    `json:"skipped_status_chats"`
 	SkippedStatusMessages     int    `json:"skipped_status_messages"`
+	MediaPathsChecked         int    `json:"media_paths_checked"`
+	MediaPathsMigrated        int    `json:"media_paths_migrated"`
+	MediaPathsMissing         int    `json:"media_paths_missing"`
 }
 
 type backupChatSession struct {
@@ -77,6 +82,10 @@ type backupImportCanonicalizer struct {
 }
 
 func (a *App) ImportIPhoneBackup(ctx context.Context, backupDir string, opts IPhoneBackupImportOptions) (IPhoneBackupImportResult, error) {
+	if opts.MigrateMediaPathsOnly {
+		return a.migrateStoredMediaPaths(ctx)
+	}
+
 	backupDir = strings.TrimSpace(backupDir)
 	if backupDir == "" {
 		return IPhoneBackupImportResult{}, fmt.Errorf("backup directory is required")
@@ -155,6 +164,47 @@ func (a *App) ImportIPhoneBackup(ctx context.Context, backupDir string, opts IPh
 	res.MediaMessagesImported += mediaImported
 	res.StarredImported += starredImported
 	res.SkippedStatusMessages += skippedStatusMessages
+
+	return res, nil
+}
+
+func (a *App) migrateStoredMediaPaths(ctx context.Context) (IPhoneBackupImportResult, error) {
+	res := IPhoneBackupImportResult{}
+	infos, err := a.db.ListStoredMediaPathInfos()
+	if err != nil {
+		return res, fmt.Errorf("list stored media paths: %w", err)
+	}
+
+	for _, info := range infos {
+		if err := ctx.Err(); err != nil {
+			return res, err
+		}
+		res.MediaPathsChecked++
+
+		normalizedPath, normalizedDownloadedAt, err := a.normalizeImportedMediaPath(
+			info.ChatJID,
+			info.MsgID,
+			info.MediaType,
+			info.Filename,
+			info.MimeType,
+			info.DownloadedAt,
+			info.LocalPath,
+		)
+		if err != nil {
+			return res, fmt.Errorf("normalize media path %s/%s: %w", info.ChatJID, info.MsgID, err)
+		}
+		if normalizedPath == "" {
+			res.MediaPathsMissing++
+			continue
+		}
+		if filepath.Clean(normalizedPath) == filepath.Clean(info.LocalPath) {
+			continue
+		}
+		if err := a.db.MarkMediaDownloaded(info.ChatJID, info.MsgID, normalizedPath, normalizedDownloadedAt); err != nil {
+			return res, fmt.Errorf("mark media downloaded %s/%s: %w", info.ChatJID, info.MsgID, err)
+		}
+		res.MediaPathsMigrated++
+	}
 
 	return res, nil
 }
@@ -506,6 +556,19 @@ func (a *App) importBackupMessages(ctx context.Context, chatDB *sql.DB, backupDi
 		if msgID == "" {
 			msgID = fmt.Sprintf("ios-backup-%d", pk)
 		}
+
+		existingLocalPath := ""
+		if existing, getErr := a.db.GetMediaDownloadInfo(session.JID, msgID); getErr == nil {
+			existingLocalPath = strings.TrimSpace(existing.LocalPath)
+		} else if !store.IsNotFound(getErr) {
+			return imported, mediaImported, starredImported, skippedStatus, fmt.Errorf("load existing media info %s/%s: %w", session.JID, msgID, getErr)
+		}
+
+		normalizedLocalPath, normalizedDownloadedAt, err := a.normalizeImportedMediaPath(session.JID, msgID, mediaType, filename, mimeType, messageTS, resolvedLocalPath, existingLocalPath)
+		if err != nil {
+			return imported, mediaImported, starredImported, skippedStatus, fmt.Errorf("normalize media path %s/%s: %w", session.JID, msgID, err)
+		}
+
 		params := store.UpsertMessageParams{
 			ChatJID:      session.JID,
 			ChatName:     session.Name,
@@ -520,10 +583,10 @@ func (a *App) importBackupMessages(ctx context.Context, chatDB *sql.DB, backupDi
 			MediaCaption: mediaCaption(strings.TrimSpace(text), mediaType),
 			Filename:     filename,
 			MimeType:     mimeType,
-			LocalPath:    resolvedLocalPath,
+			LocalPath:    normalizedLocalPath,
 		}
-		if resolvedLocalPath != "" {
-			params.DownloadedAt = messageTS
+		if !normalizedDownloadedAt.IsZero() {
+			params.DownloadedAt = normalizedDownloadedAt
 		}
 		if err := a.db.UpsertMessage(params); err != nil {
 			return imported, mediaImported, starredImported, skippedStatus, fmt.Errorf("upsert message %s/%s: %w", session.JID, msgID, err)
@@ -547,6 +610,94 @@ func (a *App) importBackupMessages(ctx context.Context, chatDB *sql.DB, backupDi
 		return imported, mediaImported, starredImported, skippedStatus, fmt.Errorf("iterate backup messages: %w", err)
 	}
 	return imported, mediaImported, starredImported, skippedStatus, nil
+}
+
+func (a *App) normalizeImportedMediaPath(chatJID, msgID, mediaType, filename, mimeType string, downloadedAt time.Time, sourcePaths ...string) (string, time.Time, error) {
+	if strings.TrimSpace(mediaType) == "" {
+		return "", time.Time{}, nil
+	}
+
+	info := store.MediaDownloadInfo{
+		ChatJID:    chatJID,
+		MsgID:      msgID,
+		MediaType:  mediaType,
+		Filename:   filename,
+		MimeType:   mimeType,
+		LocalPath:  "",
+		DirectPath: "",
+	}
+	targetPath, err := a.ResolveMediaOutputPath(info, "")
+	if err != nil {
+		return "", time.Time{}, err
+	}
+
+	targetPath = filepath.Clean(targetPath)
+	if fi, statErr := os.Stat(targetPath); statErr == nil && !fi.IsDir() {
+		if downloadedAt.IsZero() {
+			downloadedAt = time.Now().UTC()
+		}
+		return targetPath, downloadedAt, nil
+	}
+
+	var sourcePath string
+	for _, raw := range sourcePaths {
+		candidate := strings.TrimSpace(raw)
+		if candidate == "" {
+			continue
+		}
+		if abs, absErr := filepath.Abs(candidate); absErr == nil {
+			candidate = abs
+		}
+		if fi, statErr := os.Stat(candidate); statErr == nil && !fi.IsDir() {
+			sourcePath = filepath.Clean(candidate)
+			break
+		}
+	}
+	if sourcePath == "" {
+		return "", time.Time{}, nil
+	}
+
+	if sourcePath == targetPath {
+		if downloadedAt.IsZero() {
+			downloadedAt = time.Now().UTC()
+		}
+		return targetPath, downloadedAt, nil
+	}
+
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
+		return "", time.Time{}, err
+	}
+	if err := copyFile(sourcePath, targetPath); err != nil {
+		return "", time.Time{}, err
+	}
+	if downloadedAt.IsZero() {
+		downloadedAt = time.Now().UTC()
+	}
+	return targetPath, downloadedAt, nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	st, err := in.Stat()
+	if err != nil {
+		return err
+	}
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, st.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
 }
 
 func backupAppleTime(v float64) time.Time {

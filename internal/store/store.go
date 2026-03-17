@@ -332,6 +332,16 @@ type MediaDownloadInfo struct {
 	DownloadedAt  time.Time
 }
 
+type StoredMediaPathInfo struct {
+	ChatJID      string
+	MsgID        string
+	MediaType    string
+	Filename     string
+	MimeType     string
+	LocalPath    string
+	DownloadedAt time.Time
+}
+
 type Message struct {
 	ChatJID     string
 	ChatName    string
@@ -898,6 +908,46 @@ func (d *DB) MarkMediaDownloaded(chatJID, msgID, localPath string, downloadedAt 
 		WHERE chat_jid = ? AND msg_id = ?
 	`, localPath, unix(downloadedAt), chatJID, msgID)
 	return err
+}
+
+func (d *DB) ListStoredMediaPathInfos() ([]StoredMediaPathInfo, error) {
+	rows, err := d.sql.Query(`
+		SELECT chat_jid,
+		       msg_id,
+		       COALESCE(media_type,''),
+		       COALESCE(filename,''),
+		       COALESCE(mime_type,''),
+		       COALESCE(local_path,''),
+		       COALESCE(downloaded_at,0)
+		FROM messages
+		WHERE COALESCE(media_type,'') != ''
+		  AND COALESCE(local_path,'') != ''
+		ORDER BY ts ASC, rowid ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]StoredMediaPathInfo, 0)
+	for rows.Next() {
+		var info StoredMediaPathInfo
+		var downloadedAt int64
+		if err := rows.Scan(
+			&info.ChatJID,
+			&info.MsgID,
+			&info.MediaType,
+			&info.Filename,
+			&info.MimeType,
+			&info.LocalPath,
+			&downloadedAt,
+		); err != nil {
+			return nil, err
+		}
+		info.DownloadedAt = fromUnix(downloadedAt)
+		out = append(out, info)
+	}
+	return out, rows.Err()
 }
 
 func (d *DB) MessageContext(chatJID, msgID string, before, after int) ([]Message, error) {
