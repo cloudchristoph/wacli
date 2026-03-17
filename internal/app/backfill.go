@@ -243,6 +243,15 @@ func (a *App) BackfillAllChats(ctx context.Context, opts BackfillAllOptions) (Ba
 			break
 		}
 
+		// Skip broadcast lists and LID-addressed chats — WhatsApp never responds
+		// to on-demand history sync requests for these.
+		jidLower := strings.ToLower(chat.JID)
+		if strings.Contains(jidLower, "@broadcast") || strings.Contains(jidLower, "@lid") {
+			fmt.Fprintf(os.Stderr, "[%d/%d] Skipping %s (unsupported JID type)\n", i+1, total, chat.JID)
+			skipped++
+			continue
+		}
+
 		// Compute ETA from rolling average of completed chats.
 		var etaStr string
 		if i > 0 {

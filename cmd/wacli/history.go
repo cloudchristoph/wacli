@@ -140,6 +140,6 @@ are printed to stderr. Use --limit to cap the number of chats processed.`,
 	cmd.Flags().DurationVar(&idleExit, "idle-exit", 5*time.Second, "idle timeout after backfill requests per chat")
 	cmd.Flags().DurationVar(&chatDelay, "chat-delay", 5*time.Second, "pause between chats to avoid flooding")
 	cmd.Flags().IntVar(&limit, "limit", 0, "max number of chats to process (0 = all)")
-	cmd.Flags().BoolVar(&skipOnError, "skip-on-error", false, "log errors and continue instead of aborting")
+	cmd.Flags().BoolVar(&skipOnError, "skip-on-error", true, "log errors and continue instead of aborting")
 	return cmd
 }
