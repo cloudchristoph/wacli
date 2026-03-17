@@ -18,6 +18,7 @@ func newAuthCmd(flags *rootFlags) *cobra.Command {
 	var follow bool
 	var idleExit time.Duration
 	var downloadMedia bool
+	var qrFormat string
 
 	cmd := &cobra.Command{
 		Use:   "auth",
@@ -46,9 +47,13 @@ func newAuthCmd(flags *rootFlags) *cobra.Command {
 				RefreshGroups:   true,
 				IdleExit:        idleExit,
 				OnQRCode: func(code string) {
-					fmt.Fprintln(os.Stderr, "\nScan this QR code with WhatsApp (Linked Devices):")
-					qrterminal.GenerateHalfBlock(code, qrterminal.M, os.Stderr)
-					fmt.Fprintln(os.Stderr)
+					if qrFormat == "text" {
+						fmt.Fprintln(os.Stdout, code)
+					} else {
+						fmt.Fprintln(os.Stderr, "\nScan this QR code with WhatsApp (Linked Devices):")
+						qrterminal.GenerateHalfBlock(code, qrterminal.M, os.Stderr)
+						fmt.Fprintln(os.Stderr)
+					}
 				},
 			})
 			if err != nil {
@@ -70,6 +75,7 @@ func newAuthCmd(flags *rootFlags) *cobra.Command {
 	cmd.Flags().BoolVar(&follow, "follow", false, "keep syncing after auth")
 	cmd.Flags().DurationVar(&idleExit, "idle-exit", 30*time.Second, "exit after being idle (bootstrap/once modes)")
 	cmd.Flags().BoolVar(&downloadMedia, "download-media", false, "download media in the background during sync")
+	cmd.Flags().StringVar(&qrFormat, "qr-format", "terminal", "QR output format: terminal (ASCII art) or text (raw payload)")
 
 	cmd.AddCommand(newAuthStatusCmd(flags))
 	cmd.AddCommand(newAuthLogoutCmd(flags))
