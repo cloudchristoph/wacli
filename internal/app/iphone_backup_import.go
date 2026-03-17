@@ -419,10 +419,24 @@ func (a *App) importBackupGroupParticipants(ctx context.Context, sessions map[in
 		for i := range participants {
 			participants[i].GroupJID = session.JID
 		}
-		if err := a.db.ReplaceGroupParticipants(session.JID, participants); err != nil {
+		// Deduplicate by UserJID; prefer "admin" over "member" when duplicates arise
+		// from JID canonicalization (e.g. @lid and phone mapping to the same user).
+		seen := make(map[string]int, len(participants)) // userJID -> index in deduped
+		deduped := participants[:0:0]
+		for _, p := range participants {
+			if idx, exists := seen[p.UserJID]; exists {
+				if p.Role == "admin" {
+					deduped[idx].Role = "admin"
+				}
+				continue
+			}
+			seen[p.UserJID] = len(deduped)
+			deduped = append(deduped, p)
+		}
+		if err := a.db.ReplaceGroupParticipants(session.JID, deduped); err != nil {
 			return imported, fmt.Errorf("replace participants for %s: %w", session.JID, err)
 		}
-		imported += len(participants)
+		imported += len(deduped)
 	}
 	return imported, nil
 }
