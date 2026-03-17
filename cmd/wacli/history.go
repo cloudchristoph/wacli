@@ -63,12 +63,16 @@ func newHistoryBackfillCmd(flags *rootFlags) *cobra.Command {
 					"chat":            res.ChatJID,
 					"requests_sent":   res.RequestsSent,
 					"responses_seen":  res.ResponsesSeen,
+					"messages_seen":   res.MessagesSeen,
 					"messages_added":  res.MessagesAdded,
-					"messages_synced": res.MessagesSynced,
+					"messages_stored": res.MessagesStored,
+					"stop_reason":     res.StopReason,
 				})
 			}
 
-			fmt.Fprintf(os.Stdout, "Backfill complete for %s. Added %d messages (%d requests).\n", res.ChatJID, res.MessagesAdded, res.RequestsSent)
+			fmt.Fprintf(os.Stdout,
+				"Backfill complete for %s: +%d added, %d returned, %d stored, %d request(s), stop=%s.\n",
+				res.ChatJID, res.MessagesAdded, res.MessagesSeen, res.MessagesStored, res.RequestsSent, res.StopReason)
 			return nil
 		},
 	}
@@ -89,6 +93,7 @@ func newHistoryBackfillAllCmd(flags *rootFlags) *cobra.Command {
 	var chatDelay time.Duration
 	var limit int
 	var skipOnError bool
+	var skipGroups bool
 
 	cmd := &cobra.Command{
 		Use:   "backfill-all",
@@ -114,6 +119,7 @@ are printed to stderr. Use --limit to cap the number of chats processed.`,
 				Limit:          limit,
 				ChatDelay:      chatDelay,
 				SkipOnError:    skipOnError,
+				SkipGroups:     skipGroups,
 			})
 			if err != nil {
 				return err
@@ -140,6 +146,7 @@ are printed to stderr. Use --limit to cap the number of chats processed.`,
 	cmd.Flags().DurationVar(&idleExit, "idle-exit", 5*time.Second, "idle timeout after backfill requests per chat")
 	cmd.Flags().DurationVar(&chatDelay, "chat-delay", 5*time.Second, "pause between chats to avoid flooding")
 	cmd.Flags().IntVar(&limit, "limit", 0, "max number of chats to process (0 = all)")
+	cmd.Flags().BoolVar(&skipGroups, "skip-groups", false, "skip group chats (@g.us)")
 	cmd.Flags().BoolVar(&skipOnError, "skip-on-error", true, "log errors and continue instead of aborting")
 	return cmd
 }

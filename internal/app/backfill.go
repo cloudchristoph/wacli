@@ -26,8 +26,10 @@ type BackfillResult struct {
 	ChatJID        string
 	RequestsSent   int
 	ResponsesSeen  int
+	MessagesSeen   int
 	MessagesAdded  int64
-	MessagesSynced int64
+	MessagesStored int64
+	StopReason     string
 }
 
 type onDemandResponse struct {
@@ -106,6 +108,8 @@ func (a *App) BackfillHistory(ctx context.Context, opts BackfillOptions) (Backfi
 
 	var requestsSent int
 	var responsesSeen int
+	var messagesSeen int
+	stopReason := "max-requests-reached"
 
 	syncRes, err := a.Sync(ctx, SyncOptions{
 		Mode:     SyncModeOnce,
@@ -147,6 +151,7 @@ func (a *App) BackfillHistory(ctx context.Context, opts BackfillOptions) (Backfi
 					return ctx.Err()
 				case resp = <-ch:
 					responsesSeen++
+					messagesSeen += resp.messages
 				case <-time.After(opts.WaitPerRequest):
 					return fmt.Errorf("timed out waiting for on-demand history sync response")
 				}
@@ -159,20 +164,21 @@ func (a *App) BackfillHistory(ctx context.Context, opts BackfillOptions) (Backfi
 
 				fmt.Fprintf(os.Stderr, "On-demand history sync: %d conversations, %d messages.\n", resp.conversations, resp.messages)
 
-				newOldest, err := a.db.GetOldestMessageInfo(chatStr)
-				if err == nil && newOldest.MsgID == oldest.MsgID {
-					fmt.Fprintln(os.Stderr, "No older messages were added (stopping).")
+				if resp.endType == waHistorySync.Conversation_COMPLETE_AND_NO_MORE_MESSAGE_REMAIN_ON_PRIMARY {
+					stopReason = "reached-start-of-history"
 					return nil
 				}
 				if resp.messages <= 0 {
-					fmt.Fprintln(os.Stderr, "No messages returned (stopping).")
+					stopReason = "empty-response"
 					return nil
 				}
-				if resp.endType == waHistorySync.Conversation_COMPLETE_AND_NO_MORE_MESSAGE_REMAIN_ON_PRIMARY {
-					fmt.Fprintln(os.Stderr, "Reached start of chat history (stopping).")
+				newOldest, err := a.db.GetOldestMessageInfo(chatStr)
+				if err == nil && newOldest.MsgID == oldest.MsgID {
+					stopReason = "no-older-marker-change"
 					return nil
 				}
 			}
+			stopReason = "max-requests-reached"
 			return nil
 		},
 	})
@@ -181,13 +187,19 @@ func (a *App) BackfillHistory(ctx context.Context, opts BackfillOptions) (Backfi
 	}
 
 	afterCount, _ := a.db.CountMessages()
+	messagesAdded := afterCount - beforeCount
+	if stopReason == "no-older-marker-change" && messagesAdded > 0 {
+		stopReason = "progress-then-stable"
+	}
 
 	return BackfillResult{
 		ChatJID:        chatStr,
 		RequestsSent:   requestsSent,
 		ResponsesSeen:  responsesSeen,
-		MessagesAdded:  afterCount - beforeCount,
-		MessagesSynced: syncRes.MessagesStored,
+		MessagesSeen:   messagesSeen,
+		MessagesAdded:  messagesAdded,
+		MessagesStored: syncRes.MessagesStored,
+		StopReason:     stopReason,
 	}, nil
 }
 
@@ -207,6 +219,9 @@ type BackfillAllOptions struct {
 
 	// SkipOnError: if true, log and continue; otherwise abort.
 	SkipOnError bool
+
+	// SkipGroups skips group chats (@g.us).
+	SkipGroups bool
 }
 
 // BackfillAllResult is the aggregate result of BackfillAllChats.
@@ -252,14 +267,20 @@ func (a *App) BackfillAllChats(ctx context.Context, opts BackfillAllOptions) (Ba
 			continue
 		}
 
+		if opts.SkipGroups && (chat.Kind == "group" || strings.HasSuffix(jidLower, "@g.us")) {
+			fmt.Fprintf(os.Stderr, "[%d/%d] Skipping %s (group chat; --skip-groups enabled)\n", i+1, total, chat.JID)
+			skipped++
+			continue
+		}
+
 		// Compute ETA from rolling average of completed chats.
 		var etaStr string
-		if i > 0 {
+		if len(durations) > 0 {
 			var sum time.Duration
 			for _, d := range durations {
 				sum += d
 			}
-			avg := sum / time.Duration(i)
+			avg := sum / time.Duration(len(durations))
 			remaining := avg * time.Duration(total-i)
 			etaStr = fmt.Sprintf(", ~%s remaining", remaining.Round(time.Second))
 		}
@@ -297,6 +318,9 @@ func (a *App) BackfillAllChats(ctx context.Context, opts BackfillAllOptions) (Ba
 		} else {
 			totalAdded += res.MessagesAdded
 			durations = append(durations, chatElapsed)
+			fmt.Fprintf(os.Stderr,
+				"  ✓ %s: +%d added, %d returned, %d stored, %d request(s), stop=%s, took=%s\n",
+				chat.JID, res.MessagesAdded, res.MessagesSeen, res.MessagesStored, res.RequestsSent, res.StopReason, chatElapsed.Round(time.Second))
 		}
 
 		// Pause between chats (unless it's the last one).
