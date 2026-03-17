@@ -16,12 +16,21 @@ type ConsolidateLIDOptions struct {
 	Limit  int
 }
 
+type ConsolidateIdentityPair struct {
+	FromJID       string `json:"from_jid"`
+	ToJID         string `json:"to_jid"`
+	MessagesMoved int64  `json:"messages_moved"`
+	Merged        bool   `json:"merged"`
+	SkippedReason string `json:"skipped_reason,omitempty"`
+}
+
 type ConsolidateLIDResult struct {
 	MappingsFound   int
 	MappingsTried   int
 	ChatsMerged     int
 	MessagesMoved   int64
 	Pairs           []string
+	Details         []ConsolidateIdentityPair
 	SkippedInvalid  int
 	SkippedUnmapped int
 }
@@ -129,7 +138,14 @@ func (a *App) ConsolidateLIDChats(ctx context.Context, opts ConsolidateLIDOption
 			break
 		}
 
+		pairResult := ConsolidateIdentityPair{
+			FromJID: from,
+			ToJID:   to,
+		}
+
 		if opts.DryRun {
+			pairResult.SkippedReason = "dry-run"
+			result.Details = append(result.Details, pairResult)
 			result.Pairs = append(result.Pairs, key)
 			continue
 		}
@@ -138,12 +154,17 @@ func (a *App) ConsolidateLIDChats(ctx context.Context, opts ConsolidateLIDOption
 		if err != nil {
 			return result, fmt.Errorf("merge %s -> %s: %w", from, to, err)
 		}
+		pairResult.MessagesMoved = moved
 		if moved <= 0 {
+			pairResult.SkippedReason = "no-source-chat"
+			result.Details = append(result.Details, pairResult)
 			result.SkippedUnmapped++
 			continue
 		}
+		pairResult.Merged = true
 		result.MessagesMoved += moved
 		result.ChatsMerged++
+		result.Details = append(result.Details, pairResult)
 		result.Pairs = append(result.Pairs, key)
 	}
 	if err := rows.Err(); err != nil {

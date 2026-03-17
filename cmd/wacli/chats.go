@@ -19,7 +19,7 @@ func newChatsCmd(flags *rootFlags) *cobra.Command {
 	}
 	cmd.AddCommand(newChatsListCmd(flags))
 	cmd.AddCommand(newChatsShowCmd(flags))
-	cmd.AddCommand(newChatsConsolidateLIDCmd(flags))
+	cmd.AddCommand(newChatsConsolidateIdentitiesCmd(flags))
 	return cmd
 }
 
@@ -98,14 +98,19 @@ func newChatsShowCmd(flags *rootFlags) *cobra.Command {
 	return cmd
 }
 
-func newChatsConsolidateLIDCmd(flags *rootFlags) *cobra.Command {
+func newChatsConsolidateIdentitiesCmd(flags *rootFlags) *cobra.Command {
 	var dryRun bool
+	var apply bool
 	var limit int
 
 	cmd := &cobra.Command{
-		Use:   "consolidate-lid",
-		Short: "Consolidate @lid chats into phone JIDs using session mappings (lossless)",
+		Use:     "consolidate-identities",
+		Aliases: []string{"consolidate-lid"},
+		Short:   "Consolidate alternate chat identities into canonical phone JIDs and print a merge report",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if apply {
+				dryRun = false
+			}
 			ctx, cancel := withTimeout(context.Background(), flags)
 			defer cancel()
 
@@ -127,22 +132,47 @@ func newChatsConsolidateLIDCmd(flags *rootFlags) *cobra.Command {
 				return out.WriteJSON(os.Stdout, res)
 			}
 
-			if dryRun {
-				fmt.Fprintf(os.Stdout, "Dry-run: %d mappings found, %d candidates.\n", res.MappingsFound, res.MappingsTried)
-				for _, p := range res.Pairs {
-					fmt.Fprintf(os.Stdout, "  %s\n", p)
+			mode := "dry-run"
+			if !dryRun {
+				mode = "apply"
+			}
+			fmt.Fprintf(os.Stdout, "Identity consolidation (%s)\n", mode)
+			fmt.Fprintf(os.Stdout, "  Mappings found: %d\n", res.MappingsFound)
+			fmt.Fprintf(os.Stdout, "  Mappings tried: %d\n", res.MappingsTried)
+			fmt.Fprintf(os.Stdout, "  Chats merged: %d\n", res.ChatsMerged)
+			fmt.Fprintf(os.Stdout, "  Messages moved: %d\n", res.MessagesMoved)
+			fmt.Fprintf(os.Stdout, "  Skipped invalid: %d\n", res.SkippedInvalid)
+			fmt.Fprintf(os.Stdout, "  Skipped unmapped: %d\n", res.SkippedUnmapped)
+
+			if len(res.Details) > 0 {
+				w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+				fmt.Fprintln(w, "ACTION\tFROM\tTO\tMOVED\tNOTE")
+				for _, d := range res.Details {
+					action := "skip"
+					if d.Merged {
+						action = "merge"
+					}
+					note := d.SkippedReason
+					if note == "" && dryRun {
+						note = "candidate"
+					}
+					fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n", action, truncate(d.FromJID, 30), truncate(d.ToJID, 30), d.MessagesMoved, note)
 				}
+				_ = w.Flush()
+			}
+
+			if dryRun {
+				fmt.Fprintln(os.Stdout, "No data changed. Re-run with --apply to perform the merges.")
 				return nil
 			}
 
-			fmt.Fprintf(os.Stdout,
-				"Consolidation complete: merged %d chats, moved %d messages (%d mappings found, %d tried).\n",
-				res.ChatsMerged, res.MessagesMoved, res.MappingsFound, res.MappingsTried)
+			fmt.Fprintln(os.Stdout, "Consolidation complete.")
 			return nil
 		},
 	}
 
 	cmd.Flags().BoolVar(&dryRun, "dry-run", true, "show candidate merges without modifying data")
+	cmd.Flags().BoolVar(&apply, "apply", false, "perform the merges (equivalent to --dry-run=false)")
 	cmd.Flags().IntVar(&limit, "limit", 0, "max number of mappings to process (0 = all)")
 	return cmd
 }
