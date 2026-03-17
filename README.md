@@ -32,6 +32,20 @@ If you install via Homebrew, you can skip the local build step.
 
 - `go build -tags sqlite_fts5 -o ./dist/wacli ./cmd/wacli`
 
+### Option C: Install via Go (Windows/Linux/macOS)
+
+If you have Go installed, you can install the latest version directly:
+
+```bash
+go install -tags sqlite_fts5 github.com/steipete/wacli/cmd/wacli@latest
+```
+
+Ensure your `GOPATH/bin` is in your `PATH`.
+
+### Option D: Download Pre-built Binary
+
+Check the [Releases](https://github.com/steipete/wacli/releases) page for Windows, macOS, and Linux binaries.
+
 Run (local build only):
 
 - `./dist/wacli --help`
