@@ -20,6 +20,34 @@ type mediaJob struct {
 	msgID   string
 }
 
+type DownloadChatMediaOptions struct {
+	ChatJID           string
+	Limit             int
+	OutputDir         string
+	IncludeDownloaded bool
+}
+
+type DownloadChatMediaResult struct {
+	ChatJID     string
+	KnownMedia  int
+	Downloaded  int
+	Skipped     int
+	Failed      int
+	Bytes       int64
+	ResolvedDir string
+	Attempts    []ChatMediaDownloadAttempt
+}
+
+type ChatMediaDownloadAttempt struct {
+	MsgID      string
+	MediaType  string
+	Filename   string
+	TargetPath string
+	Status     string // downloaded|failed|skipped
+	Bytes      int64
+	Error      string
+}
+
 func (a *App) ResolveMediaOutputPath(info store.MediaDownloadInfo, requested string) (string, error) {
 	filename := mediaFilename(info)
 
@@ -47,6 +75,101 @@ func (a *App) ResolveMediaOutputPath(info store.MediaDownloadInfo, requested str
 		baseDir = abs
 	}
 	return filepath.Join(baseDir, filename), nil
+}
+
+func (a *App) DownloadChatMedia(ctx context.Context, opts DownloadChatMediaOptions) (DownloadChatMediaResult, error) {
+	chatJID := strings.TrimSpace(opts.ChatJID)
+	if chatJID == "" {
+		return DownloadChatMediaResult{}, fmt.Errorf("chat JID is required")
+	}
+
+	infos, err := a.db.ListMediaDownloadInfos(chatJID, opts.Limit, opts.IncludeDownloaded)
+	if err != nil {
+		return DownloadChatMediaResult{}, err
+	}
+
+	res := DownloadChatMediaResult{
+		ChatJID:    chatJID,
+		KnownMedia: len(infos),
+	}
+
+	outDir := strings.TrimSpace(opts.OutputDir)
+	requested := ""
+	if outDir != "" {
+		if !filepath.IsAbs(outDir) {
+			if abs, err := filepath.Abs(outDir); err == nil {
+				outDir = abs
+			}
+		}
+		if st, err := os.Stat(outDir); err == nil {
+			if !st.IsDir() {
+				return DownloadChatMediaResult{}, fmt.Errorf("--output must be a directory when downloading chat media in bulk")
+			}
+		} else if !os.IsNotExist(err) {
+			return DownloadChatMediaResult{}, err
+		}
+		if err := os.MkdirAll(outDir, 0700); err != nil {
+			return DownloadChatMediaResult{}, err
+		}
+		requested = outDir + string(os.PathSeparator)
+		res.ResolvedDir = outDir
+	}
+
+	for _, info := range infos {
+		attempt := ChatMediaDownloadAttempt{
+			MsgID:     info.MsgID,
+			MediaType: info.MediaType,
+			Filename:  info.Filename,
+		}
+		if strings.TrimSpace(info.MediaType) == "" || strings.TrimSpace(info.DirectPath) == "" || len(info.MediaKey) == 0 {
+			attempt.Status = "skipped"
+			attempt.Error = "missing media metadata"
+			res.Skipped++
+			res.Attempts = append(res.Attempts, attempt)
+			continue
+		}
+
+		targetPath, err := a.ResolveMediaOutputPath(info, requested)
+		if err != nil {
+			attempt.Status = "failed"
+			attempt.Error = err.Error()
+			res.Failed++
+			res.Attempts = append(res.Attempts, attempt)
+			continue
+		}
+		attempt.TargetPath = targetPath
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
+			attempt.Status = "failed"
+			attempt.Error = err.Error()
+			res.Failed++
+			res.Attempts = append(res.Attempts, attempt)
+			continue
+		}
+
+		bytes, err := a.wa.DownloadMediaToFile(ctx, info.DirectPath, info.FileEncSHA256, info.FileSHA256, info.MediaKey, info.FileLength, info.MediaType, "", targetPath)
+		if err != nil {
+			attempt.Status = "failed"
+			attempt.Error = err.Error()
+			res.Failed++
+			res.Attempts = append(res.Attempts, attempt)
+			continue
+		}
+		now := time.Now().UTC()
+		if err := a.db.MarkMediaDownloaded(info.ChatJID, info.MsgID, targetPath, now); err != nil {
+			attempt.Status = "failed"
+			attempt.Error = err.Error()
+			res.Failed++
+			res.Attempts = append(res.Attempts, attempt)
+			continue
+		}
+		attempt.Status = "downloaded"
+		attempt.Bytes = bytes
+		res.Downloaded++
+		res.Bytes += bytes
+		res.Attempts = append(res.Attempts, attempt)
+	}
+
+	return res, nil
 }
 
 func mediaFilename(info store.MediaDownloadInfo) string {

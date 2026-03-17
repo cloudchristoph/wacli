@@ -811,6 +811,82 @@ func (d *DB) GetMediaDownloadInfo(chatJID, msgID string) (MediaDownloadInfo, err
 	return info, nil
 }
 
+func (d *DB) ListMediaDownloadInfos(chatJID string, limit int, includeDownloaded bool) ([]MediaDownloadInfo, error) {
+	chatJID = strings.TrimSpace(chatJID)
+	if chatJID == "" {
+		return nil, fmt.Errorf("chat JID is required")
+	}
+
+	query := `
+		SELECT m.chat_jid,
+		       COALESCE(c.name,''),
+		       m.msg_id,
+		       COALESCE(m.media_type,''),
+		       COALESCE(m.filename,''),
+		       COALESCE(m.mime_type,''),
+		       COALESCE(m.direct_path,''),
+		       m.media_key,
+		       m.file_sha256,
+		       m.file_enc_sha256,
+		       COALESCE(m.file_length,0),
+		       COALESCE(m.local_path,''),
+		       COALESCE(m.downloaded_at,0)
+		FROM messages m
+		LEFT JOIN chats c ON c.jid = m.chat_jid
+		WHERE m.chat_jid = ?
+		  AND COALESCE(m.media_type,'') != ''
+		  AND COALESCE(m.direct_path,'') != ''
+		  AND m.media_key IS NOT NULL
+		  AND length(m.media_key) > 0`
+	args := []interface{}{chatJID}
+
+	if !includeDownloaded {
+		query += ` AND COALESCE(m.local_path,'') = ''`
+	}
+
+	query += ` ORDER BY m.ts ASC`
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+
+	rows, err := d.sql.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]MediaDownloadInfo, 0)
+	for rows.Next() {
+		var info MediaDownloadInfo
+		var fileLen sql.NullInt64
+		var downloadedAt int64
+		if err := rows.Scan(
+			&info.ChatJID,
+			&info.ChatName,
+			&info.MsgID,
+			&info.MediaType,
+			&info.Filename,
+			&info.MimeType,
+			&info.DirectPath,
+			&info.MediaKey,
+			&info.FileSHA256,
+			&info.FileEncSHA256,
+			&fileLen,
+			&info.LocalPath,
+			&downloadedAt,
+		); err != nil {
+			return nil, err
+		}
+		if fileLen.Valid && fileLen.Int64 > 0 {
+			info.FileLength = uint64(fileLen.Int64)
+		}
+		info.DownloadedAt = fromUnix(downloadedAt)
+		out = append(out, info)
+	}
+	return out, rows.Err()
+}
+
 func (d *DB) MarkMediaDownloaded(chatJID, msgID, localPath string, downloadedAt time.Time) error {
 	_, err := d.sql.Exec(`
 		UPDATE messages
