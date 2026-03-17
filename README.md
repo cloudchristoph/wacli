@@ -1,5 +1,8 @@
 # 🗃️ wacli — WhatsApp CLI: sync, search, send.
 
+![GitHub Repo Banner](https://ghrb.waren.build/banner?header=wacli%F0%9F%97%83%EF%B8%8F&subheader=WhatsApp+CLI%3A+sync%2C+search%2C+send.&bg=10A37F&color=FFFFFF&headerfont=Source+Code+Pro&support=true&watermarkpos=bottom-right)
+<!-- Created with GitHub Repo Banner by Waren Gonzaga: https://ghrb.waren.build -->
+
 WhatsApp CLI built on top of `whatsmeow`, focused on:
 
 - Best-effort local sync of message history + continuous capture
