@@ -101,7 +101,7 @@ func newSyncCmd(flags *rootFlags) *cobra.Command {
 	var refreshContacts bool
 	var refreshGroups bool
 	var enableIPC bool
-	var consolidateLIDs bool
+	var noConsolidateLIDs bool
 
 	cmd := &cobra.Command{
 		Use:   "sync",
@@ -154,7 +154,7 @@ func newSyncCmd(flags *rootFlags) *cobra.Command {
 			}
 
 			var consolidateRes appPkg.ConsolidateLIDResult
-			if consolidateLIDs {
+			if !noConsolidateLIDs {
 				consolidateRes, err = a.ConsolidateLIDChats(ctx, appPkg.ConsolidateLIDOptions{DryRun: false})
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Warning: consolidate LIDs: %v\n", err)
@@ -169,7 +169,7 @@ func newSyncCmd(flags *rootFlags) *cobra.Command {
 				})
 			}
 			fmt.Fprintf(os.Stdout, "Messages stored: %d\n", res.MessagesStored)
-			if consolidateLIDs && consolidateRes.ChatsMerged > 0 {
+			if !noConsolidateLIDs && consolidateRes.ChatsMerged > 0 {
 				fmt.Fprintf(os.Stdout, "LIDs consolidated: %d chats merged, %d messages moved\n", consolidateRes.ChatsMerged, consolidateRes.MessagesMoved)
 			}
 			return nil
@@ -183,6 +183,6 @@ func newSyncCmd(flags *rootFlags) *cobra.Command {
 	cmd.Flags().BoolVar(&refreshContacts, "refresh-contacts", false, "refresh contacts from session store into local DB")
 	cmd.Flags().BoolVar(&refreshGroups, "refresh-groups", false, "refresh joined groups (live) into local DB")
 	cmd.Flags().BoolVar(&enableIPC, "enable-ipc", true, "enable IPC socket for send commands (--follow mode only)")
-	cmd.Flags().BoolVar(&consolidateLIDs, "consolidate-lids", false, "merge @lid chats into their phone-number chats after sync")
+	cmd.Flags().BoolVar(&noConsolidateLIDs, "no-consolidate-lids", false, "skip merging @lid chats into their phone-number chats after sync")
 	return cmd
 }
