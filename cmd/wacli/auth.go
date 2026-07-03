@@ -60,13 +60,20 @@ func newAuthCmd(flags *rootFlags) *cobra.Command {
 				return err
 			}
 
+			// Sync returns nil on Ctrl-C and after server-side logouts, so
+			// verify the credentials actually survived before claiming success.
+			authed := a.WA().IsAuthed()
+
 			if flags.asJSON {
 				return out.WriteJSON(os.Stdout, map[string]interface{}{
-					"authenticated":   true,
+					"authenticated":   authed,
 					"messages_stored": res.MessagesStored,
 				})
 			}
 
+			if !authed {
+				return fmt.Errorf("not authenticated; run `wacli auth` again")
+			}
 			fmt.Fprintf(os.Stdout, "Authenticated. Messages stored: %d\n", res.MessagesStored)
 			return nil
 		},

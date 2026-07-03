@@ -235,6 +235,56 @@ func TestSyncStoresDisplayText(t *testing.T) {
 	}
 }
 
+func TestSyncAbortsOnLoggedOut(t *testing.T) {
+	a := newTestApp(t)
+	f := newFakeWA()
+	a.wa = f
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		f.emit(&events.LoggedOut{OnConnect: true, Reason: events.ConnectFailureLoggedOut})
+	}()
+
+	_, err := a.Sync(ctx, SyncOptions{
+		Mode:    SyncModeFollow,
+		AllowQR: false,
+	})
+	if err == nil {
+		t.Fatal("expected Sync to fail after LoggedOut event")
+	}
+	if ctx.Err() != nil {
+		t.Fatal("Sync did not abort on LoggedOut; hit the test timeout instead")
+	}
+}
+
+func TestSyncReconnectsOnStreamReplaced(t *testing.T) {
+	a := newTestApp(t)
+	f := newFakeWA()
+	a.wa = f
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		f.emit(&events.StreamReplaced{})
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	_, err := a.Sync(ctx, SyncOptions{
+		Mode:    SyncModeFollow,
+		AllowQR: false,
+	})
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if !f.IsConnected() {
+		t.Fatal("expected client to be reconnected after StreamReplaced")
+	}
+}
+
 func TestSyncOnceIdleExit(t *testing.T) {
 	a := newTestApp(t)
 	f := newFakeWA()

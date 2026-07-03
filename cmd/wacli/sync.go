@@ -102,6 +102,7 @@ func newSyncCmd(flags *rootFlags) *cobra.Command {
 	var refreshGroups bool
 	var enableIPC bool
 	var noConsolidateLIDs bool
+	var staleThreshold time.Duration
 
 	cmd := &cobra.Command{
 		Use:   "sync",
@@ -109,6 +110,13 @@ func newSyncCmd(flags *rootFlags) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
+
+			if staleThreshold != 0 && staleThreshold < time.Second {
+				return fmt.Errorf("--stale-threshold must be at least 1s, got %s", staleThreshold)
+			}
+			if maxStaleThreshold := appPkg.MaxStaleThreshold(); staleThreshold >= maxStaleThreshold {
+				return fmt.Errorf("--stale-threshold must be less than %s because whatsmeow auto-reconnects after that much keepalive failure, got %s", maxStaleThreshold, staleThreshold)
+			}
 
 			a, lk, err := newApp(ctx, flags, true, false)
 			if err != nil {
@@ -148,6 +156,7 @@ func newSyncCmd(flags *rootFlags) *cobra.Command {
 				RefreshContacts: refreshContacts,
 				RefreshGroups:   refreshGroups,
 				IdleExit:        idleExit,
+				StaleThreshold:  staleThreshold,
 			})
 			if err != nil {
 				return err
@@ -184,5 +193,6 @@ func newSyncCmd(flags *rootFlags) *cobra.Command {
 	cmd.Flags().BoolVar(&refreshGroups, "refresh-groups", false, "refresh joined groups (live) into local DB")
 	cmd.Flags().BoolVar(&enableIPC, "enable-ipc", true, "enable IPC socket for send commands (--follow mode only)")
 	cmd.Flags().BoolVar(&noConsolidateLIDs, "no-consolidate-lids", false, "skip merging @lid chats into their phone-number chats after sync")
+	cmd.Flags().DurationVar(&staleThreshold, "stale-threshold", 0, "force reconnect when keepalive failures last this long in follow mode (1s-<2m20s, 0 = disabled)")
 	return cmd
 }

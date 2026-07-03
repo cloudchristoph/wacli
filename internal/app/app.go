@@ -24,6 +24,7 @@ type WAClient interface {
 	AddEventHandler(handler func(interface{})) uint32
 	RemoveEventHandler(id uint32)
 	ReconnectWithBackoff(ctx context.Context, minDelay, maxDelay time.Duration) error
+	SetAutoReconnect(enabled bool) (previous bool, ok bool)
 
 	ResolveChatName(ctx context.Context, chat types.JID, pushName string) string
 	GetContact(ctx context.Context, jid types.JID) (types.ContactInfo, error)

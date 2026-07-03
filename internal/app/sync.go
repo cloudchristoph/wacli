@@ -10,6 +10,7 @@ import (
 
 	"github.com/steipete/wacli/internal/store"
 	"github.com/steipete/wacli/internal/wa"
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -31,11 +32,71 @@ type SyncOptions struct {
 	RefreshContacts bool
 	RefreshGroups   bool
 	IdleExit        time.Duration // only used for bootstrap/once
+	StaleThreshold  time.Duration // force reconnect when keepalive failures last this long in follow mode (0 = disabled)
 	Verbosity       int           // future
 }
 
 type SyncResult struct {
 	MessagesStored int64
+}
+
+// MaxStaleThreshold returns the exclusive upper bound for keepalive-failure thresholds.
+// It reserves one maximum keepalive probe interval plus response deadline before
+// whatsmeow's own failed-keepalive auto-reconnect window.
+func MaxStaleThreshold() time.Duration {
+	return whatsmeow.KeepAliveMaxFailTime - whatsmeow.KeepAliveIntervalMax - whatsmeow.KeepAliveResponseDeadline
+}
+
+type staleReconnectRequest struct {
+	threshold   time.Duration
+	idle        time.Duration
+	errorCount  int
+	lastSuccess time.Time
+}
+
+func handleKeepAliveTimeout(opts SyncOptions, evt *events.KeepAliveTimeout, staleReconnect chan<- staleReconnectRequest) {
+	if opts.Mode != SyncModeFollow || opts.StaleThreshold <= 0 || evt == nil || evt.LastSuccess.IsZero() {
+		return
+	}
+	idle := time.Since(evt.LastSuccess)
+	if idle < opts.StaleThreshold {
+		return
+	}
+	req := staleReconnectRequest{
+		threshold:   opts.StaleThreshold,
+		idle:        idle,
+		errorCount:  evt.ErrorCount,
+		lastSuccess: evt.LastSuccess,
+	}
+	select {
+	case staleReconnect <- req:
+	default:
+	}
+}
+
+// syncActivityEvent reports whether an event counts as sync activity for
+// idle-exit purposes. Error and disconnect events must not count, otherwise
+// a connection that only produces failures looks alive forever.
+func syncActivityEvent(evt interface{}) bool {
+	switch evt.(type) {
+	case nil,
+		*events.KeepAliveTimeout,
+		*events.PairError,
+		*events.LoggedOut,
+		*events.StreamReplaced,
+		*events.ManualLoginReconnect,
+		*events.TemporaryBan,
+		*events.ConnectFailure,
+		*events.ClientOutdated,
+		*events.CATRefreshError,
+		*events.StreamError,
+		*events.Disconnected,
+		*events.AppStateSyncError,
+		*events.MediaRetryError:
+		return false
+	default:
+		return true
+	}
 }
 
 func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
@@ -50,11 +111,34 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 		return SyncResult{}, err
 	}
 
+	// The stale-threshold loop drives reconnects itself, so whatsmeow's
+	// built-in auto-reconnect must be off to avoid competing reconnects.
+	if opts.Mode == SyncModeFollow && opts.StaleThreshold > 0 {
+		restoreAutoReconnect, ok := a.wa.SetAutoReconnect(false)
+		if !ok {
+			return SyncResult{}, fmt.Errorf("could not configure stale-threshold reconnect on an already-connected WhatsApp client")
+		}
+		defer func() {
+			if !a.wa.IsConnected() {
+				a.wa.SetAutoReconnect(restoreAutoReconnect)
+			}
+		}()
+	}
+
 	var messagesStored atomic.Int64
 	lastEvent := atomic.Int64{}
 	lastEvent.Store(time.Now().UTC().UnixNano())
 
 	disconnected := make(chan struct{}, 1)
+	staleReconnect := make(chan staleReconnectRequest, 1)
+	fatal := make(chan error, 1)
+	reportFatal := func(err error) {
+		select {
+		case fatal <- err:
+		default:
+		}
+	}
+	var connectionEpoch atomic.Int64
 
 	var stopMedia func()
 	var mediaJobs chan mediaJob
@@ -80,7 +164,9 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 	}
 
 	handlerID := a.wa.AddEventHandler(func(evt interface{}) {
-		lastEvent.Store(time.Now().UTC().UnixNano())
+		if syncActivityEvent(evt) {
+			lastEvent.Store(time.Now().UTC().UnixNano())
+		}
 
 		switch v := evt.(type) {
 		case *events.Message:
@@ -143,6 +229,31 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 			case disconnected <- struct{}{}:
 			default:
 			}
+		case *events.KeepAliveTimeout:
+			handleKeepAliveTimeout(opts, v, staleReconnect)
+		case *events.StreamReplaced:
+			fmt.Fprintln(os.Stderr, "\nStream replaced (another client connected with this session).")
+			// whatsmeow emits StreamReplaced before onDisconnect necessarily
+			// clears the socket, so force-close before reconnecting.
+			a.wa.Close()
+			select {
+			case disconnected <- struct{}{}:
+			default:
+			}
+		case *events.LoggedOut:
+			fmt.Fprintf(os.Stderr, "\nLogged out by server (%s); the session was removed. Run `wacli auth` to re-link.\n", v.Reason)
+			reportFatal(fmt.Errorf("logged out by server: %s", v.Reason))
+		case *events.TemporaryBan:
+			fmt.Fprintf(os.Stderr, "\n%s\n", v.String())
+			reportFatal(fmt.Errorf("temporarily banned: %s", v.Code))
+		case *events.ClientOutdated:
+			fmt.Fprintln(os.Stderr, "\nWhatsApp rejected the connection: client outdated. Update wacli (whatsmeow).")
+			reportFatal(fmt.Errorf("client outdated; update wacli"))
+		case *events.ConnectFailure:
+			fmt.Fprintf(os.Stderr, "\nConnection failure: %s (%s)\n", v.Reason, v.Message)
+			reportFatal(fmt.Errorf("connection failure: %s", v.Reason))
+		case *events.StreamError:
+			fmt.Fprintf(os.Stderr, "\nStream error (code %s).\n", v.Code)
 		}
 	})
 	defer a.wa.RemoveEventHandler(handlerID)
@@ -150,6 +261,7 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 	if err := a.Connect(ctx, opts.AllowQR, opts.OnQRCode); err != nil {
 		return SyncResult{}, err
 	}
+	connectionEpoch.Store(time.Now().UTC().UnixNano())
 
 	if opts.DownloadMedia {
 		var err error
@@ -179,8 +291,23 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 			case <-ctx.Done():
 				fmt.Fprintln(os.Stderr, "\nStopping sync.")
 				return SyncResult{MessagesStored: messagesStored.Load()}, nil
+			case err := <-fatal:
+				return SyncResult{MessagesStored: messagesStored.Load()}, err
+			case req := <-staleReconnect:
+				// Ignore stale reports from a previous connection.
+				if epoch := connectionEpoch.Load(); epoch > 0 && req.lastSuccess.Before(time.Unix(0, epoch)) {
+					continue
+				}
+				fmt.Fprintf(os.Stderr, "\nKeepalive has been failing for %s (threshold %s, %d errors), reconnecting...\n", req.idle, req.threshold, req.errorCount)
+				// Force-close so the reconnect starts from a clean socket.
+				a.wa.Close()
+				connectionEpoch.Store(time.Now().UTC().UnixNano())
+				if err := a.wa.ReconnectWithBackoff(ctx, 2*time.Second, 30*time.Second); err != nil {
+					return SyncResult{MessagesStored: messagesStored.Load()}, err
+				}
 			case <-disconnected:
 				fmt.Fprintln(os.Stderr, "Reconnecting...")
+				connectionEpoch.Store(time.Now().UTC().UnixNano())
 				if err := a.wa.ReconnectWithBackoff(ctx, 2*time.Second, 30*time.Second); err != nil {
 					return SyncResult{MessagesStored: messagesStored.Load()}, err
 				}
@@ -200,8 +327,11 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 		case <-ctx.Done():
 			fmt.Fprintln(os.Stderr, "\nStopping sync.")
 			return SyncResult{MessagesStored: messagesStored.Load()}, nil
+		case err := <-fatal:
+			return SyncResult{MessagesStored: messagesStored.Load()}, err
 		case <-disconnected:
 			fmt.Fprintln(os.Stderr, "Reconnecting...")
+			connectionEpoch.Store(time.Now().UTC().UnixNano())
 			if err := a.wa.ReconnectWithBackoff(ctx, 2*time.Second, 30*time.Second); err != nil {
 				return SyncResult{MessagesStored: messagesStored.Load()}, err
 			}

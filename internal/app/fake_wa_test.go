@@ -18,8 +18,9 @@ import (
 type fakeWA struct {
 	mu sync.Mutex
 
-	authed    bool
-	connected bool
+	authed        bool
+	connected     bool
+	autoReconnect bool
 
 	nextHandlerID uint32
 	handlers      map[uint32]func(interface{})
@@ -97,6 +98,17 @@ func (f *fakeWA) RemoveEventHandler(id uint32) {
 
 func (f *fakeWA) ReconnectWithBackoff(ctx context.Context, minDelay, maxDelay time.Duration) error {
 	return f.Connect(ctx, wa.ConnectOptions{AllowQR: false})
+}
+
+func (f *fakeWA) SetAutoReconnect(enabled bool) (bool, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.connected {
+		return f.autoReconnect, false
+	}
+	previous := f.autoReconnect
+	f.autoReconnect = enabled
+	return previous, true
 }
 
 func (f *fakeWA) ResolveChatName(ctx context.Context, chat types.JID, pushName string) string {
