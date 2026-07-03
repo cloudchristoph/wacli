@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -12,7 +13,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/steipete/wacli/internal/store"
+	"github.com/openclaw/wacli/internal/store"
 )
 
 type IPhoneBackupImportOptions struct {
@@ -560,7 +561,7 @@ func (a *App) importBackupMessages(ctx context.Context, chatDB *sql.DB, backupDi
 		existingLocalPath := ""
 		if existing, getErr := a.db.GetMediaDownloadInfo(session.JID, msgID); getErr == nil {
 			existingLocalPath = strings.TrimSpace(existing.LocalPath)
-		} else if !store.IsNotFound(getErr) {
+		} else if !errors.Is(getErr, sql.ErrNoRows) {
 			return imported, mediaImported, starredImported, skippedStatus, fmt.Errorf("load existing media info %s/%s: %w", session.JID, msgID, getErr)
 		}
 
@@ -583,13 +584,16 @@ func (a *App) importBackupMessages(ctx context.Context, chatDB *sql.DB, backupDi
 			MediaCaption: mediaCaption(strings.TrimSpace(text), mediaType),
 			Filename:     filename,
 			MimeType:     mimeType,
-			LocalPath:    normalizedLocalPath,
-		}
-		if !normalizedDownloadedAt.IsZero() {
-			params.DownloadedAt = normalizedDownloadedAt
 		}
 		if err := a.db.UpsertMessage(params); err != nil {
 			return imported, mediaImported, starredImported, skippedStatus, fmt.Errorf("upsert message %s/%s: %w", session.JID, msgID, err)
+		}
+		// Upstream UpsertMessage no longer carries local media path/downloaded_at;
+		// persist them separately so imported media paths survive.
+		if normalizedLocalPath != "" {
+			if err := a.db.MarkMediaDownloaded(session.JID, msgID, normalizedLocalPath, normalizedDownloadedAt); err != nil {
+				return imported, mediaImported, starredImported, skippedStatus, fmt.Errorf("mark media downloaded %s/%s: %w", session.JID, msgID, err)
+			}
 		}
 		imported++
 		if mediaType != "" {
@@ -600,7 +604,14 @@ func (a *App) importBackupMessages(ctx context.Context, chatDB *sql.DB, backupDi
 			if starSender == "" {
 				starSender = session.JID
 			}
-			if err := a.db.SetStarred(session.JID, starSender, msgID, true, messageTS); err != nil {
+			if err := a.db.SetStarred(store.SetStarredParams{
+				ChatJID:   session.JID,
+				MsgID:     msgID,
+				SenderJID: starSender,
+				FromMe:    isFromMe != 0,
+				Starred:   true,
+				StarredAt: messageTS,
+			}); err != nil {
 				return imported, mediaImported, starredImported, skippedStatus, fmt.Errorf("set starred %s/%s: %w", session.JID, msgID, err)
 			}
 			starredImported++

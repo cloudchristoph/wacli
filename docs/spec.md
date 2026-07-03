@@ -1,5 +1,7 @@
 # wacli specification (plan)
 
+Read when: changing the CLI contract, store model, sync model, or v1 behavior boundaries.
+
 This document defines the v1 plan for `wacli`: a WhatsApp CLI that syncs messages locally, supports fast search, sending, and contact/group management. Implementation will use `whatsmeow` under the hood.
 
 ## Goals
@@ -20,19 +22,20 @@ This document defines the v1 plan for `wacli`: a WhatsApp CLI that syncs message
 
 ## Terminology
 
-- **JID**: WhatsApp Jabber ID, e.g. `1234567890@s.whatsapp.net` (user) or `123456789@g.us` (group).
-- **Store directory**: directory containing all local state, default `~/.wacli`.
+- **JID**: WhatsApp Jabber ID, e.g. `1234567890@s.whatsapp.net` (user), `123456789@g.us` (group), or `123456789012345@newsletter` (channel).
+- **Store directory**: directory containing all local state, default `~/.local/state/wacli` on Linux and `~/.wacli` elsewhere.
 
 ## Storage layout
 
-Default store: `~/.wacli` (override with `--store DIR`).
+Default store: `~/.local/state/wacli` on Linux and `~/.wacli` elsewhere (override with `--store DIR`). Existing Linux `~/.wacli` stores are reused when the XDG state store does not exist.
 
 Proposed files:
 
-- `~/.wacli/session.db` — `whatsmeow` SQL store (device identity, keys, app-state).
-- `~/.wacli/wacli.db` — our SQLite DB (messages/chats, FTS, local metadata).
-- `~/.wacli/media/...` — downloaded media (optional, on-demand or background).
-- `~/.wacli/LOCK` — store lock to prevent concurrent access.
+- `<store>/session.db` — `whatsmeow` SQL store (device identity, keys, app-state).
+- `<store>/wacli.db` — our SQLite DB (messages/chats, FTS, local metadata).
+- `<store>/media/...` — downloaded media (optional, on-demand or background).
+- `<store>/LOCK` — store lock to prevent concurrent access.
+- `<store>/HEARTBEAT` — last observed sync follow activity timestamp (RFC 3339), written by `sync --follow` at most once per minute. Permissions `0600`. Lets `doctor` and external watchdogs inspect local follow activity; it is not a process-liveness or keepalive-health marker.
 
 Rationale for two SQLite files: reduce coupling and keep the `whatsmeow`-owned schema separate from `wacli`’s local schema. It’s still “one store directory” for the user.
 
@@ -88,20 +91,25 @@ Immediately after QR pairing success, `wacli auth` runs a bootstrap sync:
 - persists new messages as they arrive
 - performs safe reconnect with backoff on disconnect
 - continues best-effort history catch-up when WhatsApp emits it
+- optional `--stale-threshold` detects keepalive failures and force-reconnects when the last successful keepalive is older than the given duration; accepted values are `1s` up to but not including `2m20s`, reserving one maximum keepalive probe interval plus response deadline before whatsmeow auto-reconnects after 3 minutes of failed keepalives
 
 ## Database schema (wacli.db)
 
 ### Tables (proposed)
 
 - `chats`
-  - `jid` (PK), `name`, `kind` (`dm|group|broadcast`), `last_message_ts`, …
+  - `jid` (PK), `name`, `kind` (`dm|group|broadcast|newsletter|unknown`), `last_message_ts`, `archived`, `pinned`, `muted_until`, `unread`, `unread_count`, …
 - `contacts`
   - `jid` (PK), `push_name`, `full_name`, `business_name`, `phone`, …
 - `groups`
-  - `jid` (PK), `name`, `owner_jid`, `created_ts`, …
+  - `jid` (PK), `name`, `owner_jid`, `created_ts`, `is_parent`, `linked_parent_jid`, …
+  - `is_parent` marks WhatsApp Communities; `linked_parent_jid` points from a subgroup to its parent Community when WhatsApp exposes that metadata.
 - `messages`
-  - `rowid` (PK), `chat_jid`, `msg_id`, `sender_jid`, `ts`, `from_me`, `text`, `media_type`, `media_caption`, `filename`, `mime_type`, `direct_path`, hashes/keys, …
+  - `rowid` (PK), `chat_jid`, `msg_id`, `sender_jid`, `ts`, `from_me`, `text`, `display_text`, `revoked`, `deleted_for_me`, `media_type`, `media_caption`, `filename`, `mime_type`, `direct_path`, hashes/keys, …
   - unique constraint: (`chat_jid`, `msg_id`)
+- `status_messages`
+  - `rowid` (PK), `msg_id` (unique), `ts`, `from_me`, `sender_jid`, `sender_name`, `text`, `media_type`, `media_caption`, `filename`, `mime_type`, `direct_path`, hashes/keys, `background_color`, `font`, …
+  - status broadcasts use WhatsApp's `status@broadcast` target and are kept out of normal chat `messages`.
 - `contact_aliases` (local management)
   - `jid` (PK/FK), `alias`, `notes`, `tags` (or join table)
 
@@ -117,6 +125,7 @@ Approach:
   - media caption
   - document filename
   - (optionally) denormalized sender/chat names for convenience
+- Revoked and delete-for-me tombstones are excluded from list/search/starred/export results and FTS rows, but remain addressable by direct `messages show`.
 
 Query behavior:
 
@@ -132,9 +141,13 @@ Fallback:
 
 Global flags:
 
-- `--store DIR` (default `~/.wacli`)
+- `--store DIR` (default: XDG state dir on Linux, `~/.wacli` elsewhere)
+- `--account NAME` (named account from `config.yaml`; mutually exclusive with `--store`)
 - `--json` (default: human text)
+- `--full` (disable table truncation; non-TTY output keeps full IDs)
 - `--timeout DURATION` (non-sync commands; e.g. `5m`)
+- `--lock-wait DURATION` (wait for the store lock before failing write commands)
+- `--read-only` (reject commands that intentionally write WhatsApp or the local store; also `WACLI_READONLY=1`)
 - `--version` (prints version and exits)
 
 ### Doctor
@@ -147,32 +160,70 @@ Global flags:
 - `wacli auth status`
 - `wacli auth logout`
 
+### Accounts
+
+- `wacli accounts list`
+- `wacli accounts add NAME [--no-auth]`
+- `wacli accounts use NAME`
+- `wacli accounts show NAME`
+- `wacli accounts remove NAME`
+
+Named accounts resolve to isolated store directories. Account config lives in
+`<base>/config.yaml`; relative account store paths resolve from that config
+directory. `--store` remains the direct manual-store escape hatch and cannot be
+combined with `--account`.
+
 ### Sync
 
-- `wacli sync [--once] [--follow] [--download-media]`
+- `wacli sync [--once] [--follow] [--stale-threshold DURATION] [--download-media] [--webhook URL] [--webhook-secret SECRET]`
 
 Notes:
 
 - `sync` errors if not authenticated (never prints QR).
 - `--download-media` runs a bounded/concurrent media downloader for messages that contain downloadable media metadata.
+- `--webhook` posts live message JSON after successful local storage on a bounded background worker.
+- `--webhook-secret` adds an HMAC-SHA256 `X-Wacli-Signature` header and requires `--webhook`.
+- Webhook failures and full-queue drops emit warnings but do not fail sync.
 
 ### History backfill (best-effort)
 
 WhatsApp Web history is best-effort. If you want to try fetching *older* messages for a specific chat, `wacli` can send an on-demand history request to your primary device:
 
 - `wacli history backfill --chat JID [--count 50] [--requests N]`
+- `wacli history coverage` inspects local chat/message coverage without connecting.
+- `wacli history fill --dry-run` plans matching chats with local anchors; it does not write or connect.
+- Backfill caps: `--count <= 500`, `--requests <= 100`.
+- During backfill, automatic initial history-sync blob downloads are disabled; only on-demand history-sync notifications are downloaded and stored.
 
 ### Messages
 
-- `wacli messages list [--chat JID] [--limit N] [--before TS] [--after TS]`
-- `wacli messages search <query> [--chat JID] [--from JID] [--limit N] [--before TS] [--after TS] [--type text|image|video|audio|document]`
+- `wacli messages list [--chat JID] [--sender JID] [--from-me|--from-them] [--asc] [--limit N] [--before TS] [--after TS] [--forwarded] [--starred]`
+- `wacli messages search <query> [--chat JID] [--from JID] [--limit N] [--before TS] [--after TS] [--type text|image|video|audio|document] [--forwarded] [--starred]`
+- `wacli messages starred [--chat JID] [--limit N] [--before TS] [--after TS] [--asc]`
+- `wacli messages export [--chat JID] [--limit N] [--before TS] [--after TS] [--output PATH]`
 - `wacli messages show --chat JID --id MSG_ID`
 - `wacli messages context --chat JID --id MSG_ID [--before N] [--after N]`
+- `wacli messages edit --chat JID --id MSG_ID --message TEXT [--post-send-wait 2s]`
+- `wacli messages delete --chat JID --id MSG_ID [--for-me] [--delete-media] [--post-send-wait 2s]`
 
 ### Send
 
-- `wacli send text --to PHONE_OR_JID --message TEXT`
-- `wacli send file --to PHONE_OR_JID --file PATH [--caption TEXT] [--mime TYPE]`
+- `wacli send text --to RECIPIENT --message TEXT [--message-escapes] [--pick N] [--no-preview] [--reply-to MSG_ID] [--reply-to-sender JID]`
+- `wacli send file --to RECIPIENT --file PATH [--caption TEXT] [--mime TYPE] [--pick N] [--ptt] [--reply-to MSG_ID] [--reply-to-sender JID]`
+- `wacli send sticker --to RECIPIENT --file PATH [--pick N] [--reply-to MSG_ID] [--reply-to-sender JID]`
+- `wacli send voice --to RECIPIENT --file PATH [--mime TYPE] [--pick N] [--reply-to MSG_ID] [--reply-to-sender JID]`
+- `wacli send react --to PHONE_OR_JID --id MSG_ID [--reaction TEXT] [--sender JID]`
+- `wacli send status [--message TEXT] [--file PATH] [--mime TYPE] [--background-color '#RRGGBB'] [--font N]`
+
+`RECIPIENT` accepts a JID, phone number, channel JID (`...@newsletter`), or synced contact/group/chat name. If a name is ambiguous, interactive terminals prompt; scripts can pass `--pick N`.
+Sending to channels requires channel posting permission. File sends to channels use WhatsApp's unencrypted newsletter media upload and pass the returned media handle through `whatsmeow.SendRequestExtra`.
+Text sends automatically include a link preview for the first `http://` or `https://` URL unless `--no-preview` is passed.
+Voice notes require OGG/Opus audio and use optional `ffprobe`/`ffmpeg` metadata when available.
+Stickers require 512x512 WebP input and are stored locally as `sticker` media after sending. Static stickers are capped at 100 KiB; animated stickers are capped at 500 KiB and carry animation metadata in the outgoing proto.
+Status broadcasts are sent to `status@broadcast`; text statuses can carry background color and font metadata, and media statuses reuse the file upload path with optional captions.
+
+Send-file uploads and media downloads are capped at 100 MiB to avoid reading
+or writing unexpectedly large payloads in one command.
 
 ### Contacts (read + local management)
 
@@ -185,8 +236,13 @@ WhatsApp Web history is best-effort. If you want to try fetching *older* message
 
 ### Chats
 
-- `wacli chats list [--query TEXT]`
+- `wacli chats list [--query TEXT] [--limit N] [--archived|--no-archived] [--pinned|--no-pinned] [--muted|--no-muted] [--unread|--no-unread]`
 - `wacli chats show --jid JID`
+- `wacli chats archive|unarchive --chat CHAT [--pick N]`
+- `wacli chats pin|unpin --chat CHAT [--pick N]`
+- `wacli chats mute --chat CHAT [--duration DURATION] [--pick N]`
+- `wacli chats unmute --chat CHAT [--pick N]`
+- `wacli chats mark-read|mark-unread --chat CHAT [--pick N]`
 
 ### Groups
 
@@ -199,6 +255,13 @@ WhatsApp Web history is best-effort. If you want to try fetching *older* message
 - `wacli groups invite link get|revoke --jid GROUP_JID`
 - `wacli groups join --code INVITE_CODE`
 - `wacli groups leave --jid GROUP_JID`
+
+### Channels
+
+- `wacli channels list`
+- `wacli channels info --jid CHANNEL_JID`
+- `wacli channels join --invite LINK_OR_CODE`
+- `wacli channels leave --jid CHANNEL_JID`
 
 ## Output formats
 
@@ -234,7 +297,7 @@ Recommendation:
 - `sync` (non-interactive, follow mode)
 - `messages list/search` with FTS5
 - `send text`
-- store locking, default `~/.wacli`
+- store locking, default state dir
 
 ### v0.2
 

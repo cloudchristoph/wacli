@@ -7,9 +7,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/openclaw/wacli/internal/app"
+	"github.com/openclaw/wacli/internal/out"
+	"github.com/openclaw/wacli/internal/wa"
 	"github.com/spf13/cobra"
-	"github.com/steipete/wacli/internal/app"
-	"github.com/steipete/wacli/internal/out"
 )
 
 func newMediaCmd(flags *rootFlags) *cobra.Command {
@@ -39,18 +40,30 @@ func newMediaDownloadCmd(flags *rootFlags) *cobra.Command {
 			if !all && id == "" {
 				return fmt.Errorf("--id is required (or use --all)")
 			}
+			readOnly := flags.isReadOnly()
+			if readOnly {
+				if strings.TrimSpace(outputPath) == "" {
+					return fmt.Errorf("--output is required in read-only mode")
+				}
+			} else {
+				if err := flags.requireWritable(); err != nil {
+					return err
+				}
+			}
 
 			ctx, cancel := withTimeout(context.Background(), flags)
 			defer cancel()
 
-			a, lk, err := newApp(ctx, flags, true, false)
+			a, lk, err := newApp(ctx, flags, !readOnly, false)
 			if err != nil {
 				return err
 			}
 			defer closeApp(a, lk)
 
-			if err := a.EnsureAuthed(); err != nil {
-				return err
+			if !readOnly {
+				if err := a.EnsureAuthed(); err != nil {
+					return err
+				}
 			}
 
 			resolvedChat := chat
@@ -174,6 +187,29 @@ func newMediaDownloadCmd(flags *rootFlags) *cobra.Command {
 				return err
 			}
 
+			if readOnly {
+				bytes, err := wa.DownloadMediaDirectToFile(ctx, info.DirectPath, info.FileEncSHA256, info.FileSHA256, info.MediaKey, info.FileLength, info.MediaType, target)
+				if err != nil {
+					return err
+				}
+				resp := map[string]any{
+					"chat":       info.ChatJID,
+					"id":         info.MsgID,
+					"path":       target,
+					"bytes":      bytes,
+					"media_type": info.MediaType,
+					"mime_type":  info.MimeType,
+					"downloaded": true,
+					"read_only":  true,
+					"recorded":   false,
+				}
+				if flags.asJSON {
+					return out.WriteJSON(os.Stdout, resp)
+				}
+				fmt.Fprintf(os.Stdout, "%s (%d bytes)\n", target, bytes)
+				return nil
+			}
+
 			if err := a.Connect(ctx, false, nil); err != nil {
 				return err
 			}
@@ -183,7 +219,9 @@ func newMediaDownloadCmd(flags *rootFlags) *cobra.Command {
 				return err
 			}
 			now := time.Now().UTC()
-			_ = a.DB().MarkMediaDownloaded(info.ChatJID, info.MsgID, target, now)
+			if err := a.DB().MarkMediaDownloaded(info.ChatJID, info.MsgID, target, now); err != nil {
+				return fmt.Errorf("record media download: %w", err)
+			}
 
 			resp := map[string]any{
 				"chat":          resolvedChat,

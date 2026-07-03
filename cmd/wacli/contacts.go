@@ -5,10 +5,9 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"text/tabwriter"
 
+	"github.com/openclaw/wacli/internal/out"
 	"github.com/spf13/cobra"
-	"github.com/steipete/wacli/internal/out"
 )
 
 func newContactsCmd(flags *rootFlags) *cobra.Command {
@@ -19,6 +18,7 @@ func newContactsCmd(flags *rootFlags) *cobra.Command {
 	cmd.AddCommand(newContactsSearchCmd(flags))
 	cmd.AddCommand(newContactsShowCmd(flags))
 	cmd.AddCommand(newContactsRefreshCmd(flags))
+	cmd.AddCommand(newContactsImportSystemCmd(flags))
 	cmd.AddCommand(newContactsAliasCmd(flags))
 	cmd.AddCommand(newContactsTagsCmd(flags))
 	return cmd
@@ -49,13 +49,14 @@ func newContactsSearchCmd(flags *rootFlags) *cobra.Command {
 				return out.WriteJSON(os.Stdout, cs)
 			}
 
-			w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+			fullOutput := fullTableOutput(flags.fullOutput)
+			w := newTableWriter(os.Stdout)
 			fmt.Fprintln(w, "ALIAS\tNAME\tPHONE\tJID")
 			for _, c := range cs {
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
-					truncate(c.Alias, 18),
-					truncate(c.Name, 24),
-					truncate(c.Phone, 14),
+					tableCell(c.Alias, 18, fullOutput),
+					tableCell(c.Name, 24, fullOutput),
+					tableCell(c.Phone, 14, fullOutput),
 					c.JID,
 				)
 			}
@@ -94,18 +95,25 @@ func newContactsShowCmd(flags *rootFlags) *cobra.Command {
 				return out.WriteJSON(os.Stdout, c)
 			}
 
-			fmt.Fprintf(os.Stdout, "JID: %s\n", c.JID)
+			fmt.Fprintf(os.Stdout, "JID: %s\n", sanitize(c.JID))
 			if c.Phone != "" {
-				fmt.Fprintf(os.Stdout, "Phone: %s\n", c.Phone)
+				fmt.Fprintf(os.Stdout, "Phone: %s\n", sanitize(c.Phone))
 			}
 			if c.Name != "" {
-				fmt.Fprintf(os.Stdout, "Name: %s\n", c.Name)
+				fmt.Fprintf(os.Stdout, "Name: %s\n", sanitize(c.Name))
 			}
 			if c.Alias != "" {
-				fmt.Fprintf(os.Stdout, "Alias: %s\n", c.Alias)
+				fmt.Fprintf(os.Stdout, "Alias: %s\n", sanitize(c.Alias))
+			}
+			if c.SystemName != "" {
+				fmt.Fprintf(os.Stdout, "System Name: %s\n", sanitize(c.SystemName))
 			}
 			if len(c.Tags) > 0 {
-				fmt.Fprintf(os.Stdout, "Tags: %s\n", strings.Join(c.Tags, ", "))
+				tags := make([]string, 0, len(c.Tags))
+				for _, tag := range c.Tags {
+					tags = append(tags, sanitize(tag))
+				}
+				fmt.Fprintf(os.Stdout, "Tags: %s\n", strings.Join(tags, ", "))
 			}
 			return nil
 		},
@@ -119,6 +127,9 @@ func newContactsRefreshCmd(flags *rootFlags) *cobra.Command {
 		Use:   "refresh",
 		Short: "Import contacts from whatsmeow store into local DB",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := flags.requireWritable(); err != nil {
+				return err
+			}
 			ctx, cancel := withTimeout(context.Background(), flags)
 			defer cancel()
 
@@ -138,14 +149,17 @@ func newContactsRefreshCmd(flags *rootFlags) *cobra.Command {
 
 			var count int
 			for jid, info := range cs {
-				_ = a.DB().UpsertContact(
+				jid = canonicalCLIJID(jid)
+				if err := a.DB().UpsertContact(
 					jid.String(),
 					jid.User,
 					info.PushName,
 					info.FullName,
 					info.FirstName,
 					info.BusinessName,
-				)
+				); err != nil {
+					return fmt.Errorf("upsert contact %s: %w", jid.String(), err)
+				}
 				count++
 			}
 
@@ -173,9 +187,12 @@ func newContactsAliasCmd(flags *rootFlags) *cobra.Command {
 			if strings.TrimSpace(jid) == "" || strings.TrimSpace(alias) == "" {
 				return fmt.Errorf("--jid and --alias are required")
 			}
+			if err := flags.requireWritable(); err != nil {
+				return err
+			}
 			ctx, cancel := withTimeout(context.Background(), flags)
 			defer cancel()
-			a, lk, err := newApp(ctx, flags, false, false)
+			a, lk, err := newApp(ctx, flags, true, false)
 			if err != nil {
 				return err
 			}
@@ -198,9 +215,12 @@ func newContactsAliasCmd(flags *rootFlags) *cobra.Command {
 			if strings.TrimSpace(jid) == "" {
 				return fmt.Errorf("--jid is required")
 			}
+			if err := flags.requireWritable(); err != nil {
+				return err
+			}
 			ctx, cancel := withTimeout(context.Background(), flags)
 			defer cancel()
-			a, lk, err := newApp(ctx, flags, false, false)
+			a, lk, err := newApp(ctx, flags, true, false)
 			if err != nil {
 				return err
 			}
@@ -235,9 +255,12 @@ func newContactsTagsCmd(flags *rootFlags) *cobra.Command {
 			if strings.TrimSpace(jid) == "" || strings.TrimSpace(tag) == "" {
 				return fmt.Errorf("--jid and --tag are required")
 			}
+			if err := flags.requireWritable(); err != nil {
+				return err
+			}
 			ctx, cancel := withTimeout(context.Background(), flags)
 			defer cancel()
-			a, lk, err := newApp(ctx, flags, false, false)
+			a, lk, err := newApp(ctx, flags, true, false)
 			if err != nil {
 				return err
 			}
@@ -261,9 +284,12 @@ func newContactsTagsCmd(flags *rootFlags) *cobra.Command {
 			if strings.TrimSpace(jid) == "" || strings.TrimSpace(tag) == "" {
 				return fmt.Errorf("--jid and --tag are required")
 			}
+			if err := flags.requireWritable(); err != nil {
+				return err
+			}
 			ctx, cancel := withTimeout(context.Background(), flags)
 			defer cancel()
-			a, lk, err := newApp(ctx, flags, false, false)
+			a, lk, err := newApp(ctx, flags, true, false)
 			if err != nil {
 				return err
 			}

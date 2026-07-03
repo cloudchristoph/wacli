@@ -41,10 +41,11 @@ func TestRefreshGroupsStoresGroupsAndChats(t *testing.T) {
 	gid := types.JID{User: "12345", Server: types.GroupServer}
 	created := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 	f.groups[gid] = &types.GroupInfo{
-		JID:          gid,
-		OwnerJID:     types.JID{User: "999", Server: types.DefaultUserServer},
-		GroupName:    types.GroupName{Name: "MyGroup"},
-		GroupCreated: created,
+		JID:               gid,
+		OwnerJID:          types.JID{User: "999", Server: types.DefaultUserServer},
+		GroupName:         types.GroupName{Name: "MyGroup"},
+		GroupCreated:      created,
+		GroupLinkedParent: types.GroupLinkedParent{LinkedParentJID: types.JID{User: "parent", Server: types.GroupServer}},
 	}
 
 	if err := a.refreshGroups(context.Background()); err != nil {
@@ -57,11 +58,69 @@ func TestRefreshGroupsStoresGroupsAndChats(t *testing.T) {
 	if len(gs) != 1 || gs[0].JID != gid.String() {
 		t.Fatalf("expected group to be stored, got %+v", gs)
 	}
+	if gs[0].LinkedParentJID != "parent@g.us" {
+		t.Fatalf("expected linked parent to be stored, got %+v", gs[0])
+	}
 	c, err := a.db.GetChat(gid.String())
 	if err != nil {
 		t.Fatalf("GetChat: %v", err)
 	}
 	if c.Kind != "group" {
 		t.Fatalf("expected chat kind group, got %q", c.Kind)
+	}
+}
+
+func TestRefreshNewslettersStoresChats(t *testing.T) {
+	a := newTestApp(t)
+	f := newFakeWA()
+	a.wa = f
+
+	jid := types.JID{User: "12345", Server: types.NewsletterServer}
+	f.news[jid] = &types.NewsletterMetadata{
+		ID: jid,
+		ThreadMeta: types.NewsletterThreadMetadata{
+			Name: types.NewsletterText{Text: "Launch Notes"},
+		},
+	}
+
+	if err := a.refreshNewsletters(context.Background()); err != nil {
+		t.Fatalf("refreshNewsletters: %v", err)
+	}
+	c, err := a.db.GetChat(jid.String())
+	if err != nil {
+		t.Fatalf("GetChat: %v", err)
+	}
+	if c.Kind != "newsletter" || c.Name != "Launch Notes" {
+		t.Fatalf("expected newsletter chat, got %+v", c)
+	}
+}
+
+func TestRefreshGroupsMarksMissingGroupsLeft(t *testing.T) {
+	a := newTestApp(t)
+	f := newFakeWA()
+	a.wa = f
+
+	active := types.JID{User: "active", Server: types.GroupServer}
+	left := types.JID{User: "left", Server: types.GroupServer}
+	if err := a.db.UpsertGroup(active.String(), "Active", "", time.Time{}); err != nil {
+		t.Fatalf("UpsertGroup active: %v", err)
+	}
+	if err := a.db.UpsertGroup(left.String(), "Left", "", time.Time{}); err != nil {
+		t.Fatalf("UpsertGroup left: %v", err)
+	}
+	f.groups[active] = &types.GroupInfo{
+		JID:       active,
+		GroupName: types.GroupName{Name: "Active"},
+	}
+
+	if err := a.refreshGroups(context.Background()); err != nil {
+		t.Fatalf("refreshGroups: %v", err)
+	}
+	gs, err := a.db.ListGroups("", 10)
+	if err != nil {
+		t.Fatalf("ListGroups: %v", err)
+	}
+	if len(gs) != 1 || gs[0].JID != active.String() {
+		t.Fatalf("expected only active group, got %+v", gs)
 	}
 }

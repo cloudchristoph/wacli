@@ -4,11 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"text/tabwriter"
 	"time"
 
+	"github.com/openclaw/wacli/internal/out"
 	"github.com/spf13/cobra"
-	"github.com/steipete/wacli/internal/out"
 )
 
 func newGroupsRefreshCmd(flags *rootFlags) *cobra.Command {
@@ -16,6 +15,9 @@ func newGroupsRefreshCmd(flags *rootFlags) *cobra.Command {
 		Use:   "refresh",
 		Short: "Fetch joined groups (live) and update local DB",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := flags.requireWritable(); err != nil {
+				return err
+			}
 			ctx, cancel := withTimeout(context.Background(), flags)
 			defer cancel()
 
@@ -36,12 +38,18 @@ func newGroupsRefreshCmd(flags *rootFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			joined := map[string]bool{}
+			now := time.Now().UTC()
 			for _, g := range gs {
 				if g == nil {
 					continue
 				}
+				joined[g.JID.String()] = true
 				_ = persistGroupInfo(a.DB(), g)
-				_ = a.DB().UpsertChat(g.JID.String(), "group", g.GroupName.Name, time.Now())
+				_ = a.DB().UpsertChat(g.JID.String(), "group", g.GroupName.Name, now)
+			}
+			if err := a.DB().MarkGroupsMissingFrom(joined, now); err != nil {
+				return err
 			}
 
 			if flags.asJSON {
@@ -78,14 +86,25 @@ func newGroupsListCmd(flags *rootFlags) *cobra.Command {
 				return out.WriteJSON(os.Stdout, gs)
 			}
 
-			w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "NAME\tJID\tCREATED")
+			fullOutput := fullTableOutput(flags.fullOutput)
+			w := newTableWriter(os.Stdout)
+			fmt.Fprintln(w, "NAME\tJID\tTYPE\tPARENT\tCREATED")
 			for _, g := range gs {
 				name := g.Name
 				if name == "" {
 					name = g.JID
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\n", truncate(name, 40), g.JID, g.CreatedAt.Local().Format("2006-01-02"))
+				parent := g.LinkedParentJID
+				if parent == "" {
+					parent = "-"
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+					tableCell(name, 40, fullOutput),
+					g.JID,
+					groupKindLabel(g.IsParent, g.LinkedParentJID),
+					parent,
+					g.CreatedAt.Local().Format("2006-01-02"),
+				)
 			}
 			_ = w.Flush()
 			return nil

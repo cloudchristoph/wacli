@@ -1,0 +1,17 @@
+version: "2"
+sql:
+  - engine: "sqlite"
+    schema:
+      - "internal/store/schema.sql"
+      - "internal/store/sqlc/fts_stub.sql"
+    queries:
+      - "internal/store/sqlc/queries.sql"
+    gen:
+      go:
+        package: "storedb"
+        out: "internal/store/storedb"
+        sql_package: "database/sql"
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_interface: false
+        emit_exact_table_names: false

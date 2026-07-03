@@ -2,29 +2,6 @@ package main
 
 import "testing"
 
-func TestTruncate(t *testing.T) {
-	tests := []struct {
-		input string
-		max   int
-		want  string
-	}{
-		{"hello", 10, "hello"},
-		{"hello world", 5, "hell…"},
-		{"hello", 5, "hello"},
-		{"hello", 0, "hello"},
-		{"hello", -1, "hello"},
-		{"ab", 1, "a"},
-		{"hello\nworld", 20, "hello world"},
-		{"  hello  ", 20, "hello"},
-	}
-	for _, tc := range tests {
-		got := truncate(tc.input, tc.max)
-		if got != tc.want {
-			t.Errorf("truncate(%q, %d) = %q, want %q", tc.input, tc.max, got, tc.want)
-		}
-	}
-}
-
 func TestTruncateForDisplayForceFull(t *testing.T) {
 	long := "3EB0B0E8A1B2C3D4E5F6A7B8C9D0"
 

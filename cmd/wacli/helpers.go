@@ -6,11 +6,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/openclaw/wacli/internal/out"
 	"golang.org/x/term"
 )
 
 func isTTY() bool {
 	return term.IsTerminal(int(os.Stdout.Fd()))
+}
+
+func isInteractive() bool {
+	return term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stderr.Fd()))
 }
 
 func parseTime(s string) (time.Time, error) {
@@ -28,18 +33,34 @@ func parseTime(s string) (time.Time, error) {
 }
 
 func sanitize(s string) string {
-	return strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
+	return out.SanitizeHuman(s)
+}
+
+func sanitizeBody(s string) string {
+	return out.SanitizeBody(s)
 }
 
 func truncate(s string, max int) string {
 	s = sanitize(s)
-	if max <= 0 || len(s) <= max {
+	if max <= 0 {
+		return s
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
 		return s
 	}
 	if max <= 1 {
-		return s[:max]
+		return string(runes[:max])
 	}
-	return s[:max-1] + "…"
+	return string(runes[:max-1]) + "…"
+}
+
+func fullTableOutput(forceFull bool) bool {
+	return fullTableOutputWithTTY(forceFull, isTTY())
+}
+
+func fullTableOutputWithTTY(forceFull, tty bool) bool {
+	return forceFull || !tty
 }
 
 // truncateForDisplay truncates strings for tabular output.

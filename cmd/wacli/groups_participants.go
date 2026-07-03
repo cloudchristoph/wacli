@@ -6,9 +6,9 @@ import (
 	"os"
 	"strings"
 
+	"github.com/openclaw/wacli/internal/out"
+	"github.com/openclaw/wacli/internal/wa"
 	"github.com/spf13/cobra"
-	"github.com/steipete/wacli/internal/out"
-	"github.com/steipete/wacli/internal/wa"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -33,6 +33,9 @@ func newGroupsParticipantsActionCmd(flags *rootFlags, action string) *cobra.Comm
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if strings.TrimSpace(group) == "" || len(users) == 0 {
 				return fmt.Errorf("--jid and at least one --user are required")
+			}
+			if err := flags.requireWritable(); err != nil {
+				return err
 			}
 			ctx, cancel := withTimeout(context.Background(), flags)
 			defer cancel()
@@ -79,6 +82,6 @@ func newGroupsParticipantsActionCmd(flags *rootFlags, action string) *cobra.Comm
 		},
 	}
 	cmd.Flags().StringVar(&group, "jid", "", "group JID (…@g.us)")
-	cmd.Flags().StringSliceVar(&users, "user", nil, "user phone number or JID (repeatable)")
+	cmd.Flags().StringSliceVar(&users, "user", nil, "user phone number (+E164 and formatting ok) or JID (repeatable)")
 	return cmd
 }

@@ -2,18 +2,29 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/steipete/wacli/internal/store"
-	"github.com/steipete/wacli/internal/wa"
+	"github.com/openclaw/wacli/internal/store"
+	"github.com/openclaw/wacli/internal/wa"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/types"
-	"go.mau.fi/whatsmeow/types/events"
 )
+
+const maxAuthConnectAttempts = 3
+
+// MaxStaleThreshold returns the exclusive upper bound for keepalive-failure thresholds.
+// It reserves one maximum keepalive probe interval plus response deadline before
+// whatsmeow's own failed-keepalive auto-reconnect window.
+func MaxStaleThreshold() time.Duration {
+	return whatsmeow.KeepAliveMaxFailTime - whatsmeow.KeepAliveIntervalMax - whatsmeow.KeepAliveResponseDeadline
+}
 
 type SyncMode string
 
@@ -24,95 +35,63 @@ const (
 )
 
 type SyncOptions struct {
-	Mode            SyncMode
-	AllowQR         bool
-	OnQRCode        func(string)
-	AfterConnect    func(context.Context) error
-	DownloadMedia   bool
-	RefreshContacts bool
-	RefreshGroups   bool
-	IdleExit        time.Duration // only used for bootstrap/once
-	StaleThreshold  time.Duration // force reconnect when keepalive failures last this long in follow mode (0 = disabled)
-	Verbosity       int           // future
+	Mode                SyncMode
+	AllowQR             bool
+	OnQRCode            func(string)
+	PairPhoneNumber     string
+	OnPairCode          func(string)
+	AfterConnect        func(context.Context) error
+	DownloadMedia       bool
+	RefreshContacts     bool
+	RefreshGroups       bool
+	RefreshChannels     bool
+	IdleExit            time.Duration // only used for bootstrap/once
+	MaxReconnect        time.Duration // max time to attempt reconnection before giving up (0 = unlimited)
+	StaleThreshold      time.Duration // force reconnect when keepalive failures last this long in follow mode (0 = disabled)
+	MaxMessages         int64         // 0 = unlimited
+	MaxDBSizeBytes      int64         // 0 = unlimited
+	WarnNoLimits        bool
+	WebhookURL          string
+	WebhookSecret       string
+	WebhookAllowPrivate bool
+	Verbosity           int // future
 }
 
 type SyncResult struct {
 	MessagesStored int64
 }
 
-// MaxStaleThreshold returns the exclusive upper bound for keepalive-failure thresholds.
-// It reserves one maximum keepalive probe interval plus response deadline before
-// whatsmeow's own failed-keepalive auto-reconnect window.
-func MaxStaleThreshold() time.Duration {
-	return whatsmeow.KeepAliveMaxFailTime - whatsmeow.KeepAliveIntervalMax - whatsmeow.KeepAliveResponseDeadline
-}
-
-type staleReconnectRequest struct {
-	threshold   time.Duration
-	idle        time.Duration
-	errorCount  int
-	lastSuccess time.Time
-}
-
-func handleKeepAliveTimeout(opts SyncOptions, evt *events.KeepAliveTimeout, staleReconnect chan<- staleReconnectRequest) {
-	if opts.Mode != SyncModeFollow || opts.StaleThreshold <= 0 || evt == nil || evt.LastSuccess.IsZero() {
-		return
-	}
-	idle := time.Since(evt.LastSuccess)
-	if idle < opts.StaleThreshold {
-		return
-	}
-	req := staleReconnectRequest{
-		threshold:   opts.StaleThreshold,
-		idle:        idle,
-		errorCount:  evt.ErrorCount,
-		lastSuccess: evt.LastSuccess,
-	}
-	select {
-	case staleReconnect <- req:
-	default:
-	}
-}
-
-// syncActivityEvent reports whether an event counts as sync activity for
-// idle-exit purposes. Error and disconnect events must not count, otherwise
-// a connection that only produces failures looks alive forever.
-func syncActivityEvent(evt interface{}) bool {
-	switch evt.(type) {
-	case nil,
-		*events.KeepAliveTimeout,
-		*events.PairError,
-		*events.LoggedOut,
-		*events.StreamReplaced,
-		*events.ManualLoginReconnect,
-		*events.TemporaryBan,
-		*events.ConnectFailure,
-		*events.ClientOutdated,
-		*events.CATRefreshError,
-		*events.StreamError,
-		*events.Disconnected,
-		*events.AppStateSyncError,
-		*events.MediaRetryError:
-		return false
-	default:
-		return true
-	}
-}
-
 func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
+	status := a.beginSyncStatus()
+	defer a.endSyncStatus(status)
+
 	if opts.Mode == "" {
 		opts.Mode = SyncModeFollow
 	}
 	if (opts.Mode == SyncModeBootstrap || opts.Mode == SyncModeOnce) && opts.IdleExit <= 0 {
 		opts.IdleExit = 30 * time.Second
 	}
+	if maxStaleThreshold := MaxStaleThreshold(); opts.StaleThreshold >= maxStaleThreshold {
+		return SyncResult{}, fmt.Errorf("stale threshold %s must be less than upstream auto-reconnect threshold %s", opts.StaleThreshold, maxStaleThreshold)
+	}
+	if opts.WarnNoLimits && opts.MaxMessages <= 0 && opts.MaxDBSizeBytes <= 0 {
+		a.emitWarning(
+			"sync_storage_uncapped",
+			"warning: sync storage is uncapped; use --max-messages or --max-db-size to bound local history growth",
+			nil,
+		)
+	}
+	if err := a.checkSyncStorageLimits(opts); err != nil {
+		return SyncResult{}, err
+	}
+
+	syncCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	limits := &syncStorageLimits{app: a, opts: opts, cancel: cancel}
 
 	if err := a.OpenWA(); err != nil {
 		return SyncResult{}, err
 	}
-
-	// The stale-threshold loop drives reconnects itself, so whatsmeow's
-	// built-in auto-reconnect must be off to avoid competing reconnects.
 	if opts.Mode == SyncModeFollow && opts.StaleThreshold > 0 {
 		restoreAutoReconnect, ok := a.wa.SetAutoReconnect(false)
 		if !ok {
@@ -124,13 +103,20 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 			}
 		}()
 	}
+	a.wa.SetManualHistorySyncDownload(true)
+	defer a.wa.SetManualHistorySyncDownload(false)
 
 	var messagesStored atomic.Int64
 	lastEvent := atomic.Int64{}
-	lastEvent.Store(time.Now().UTC().UnixNano())
+	connectionEpoch := atomic.Int64{}
+	now := nowUTC().UnixNano()
+	lastEvent.Store(now)
 
 	disconnected := make(chan struct{}, 1)
 	staleReconnect := make(chan staleReconnectRequest, 1)
+	// fatal carries unrecoverable connection events (logged out, temporary ban,
+	// client outdated, connect failure) so the sync loop aborts with a visible
+	// error instead of silently spinning on reconnects.
 	fatal := make(chan error, 1)
 	reportFatal := func(err error) {
 		select {
@@ -138,239 +124,266 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 		default:
 		}
 	}
-	var connectionEpoch atomic.Int64
 
 	var stopMedia func()
 	var mediaJobs chan mediaJob
 	enqueueMedia := func(chatJID, msgID string) {}
 	if opts.DownloadMedia {
 		mediaJobs = make(chan mediaJob, 512)
-		enqueueMedia = func(chatJID, msgID string) {
-			if strings.TrimSpace(chatJID) == "" || strings.TrimSpace(msgID) == "" {
-				return
-			}
-			select {
-			case mediaJobs <- mediaJob{chatJID: chatJID, msgID: msgID}:
-			default:
-				// Avoid blocking the event handler.
-				go func() {
-					select {
-					case mediaJobs <- mediaJob{chatJID: chatJID, msgID: msgID}:
-					case <-ctx.Done():
-					}
-				}()
-			}
-		}
+		enqueueMedia = newMediaEnqueuer(syncCtx, mediaJobs)
 	}
-
-	handlerID := a.wa.AddEventHandler(func(evt interface{}) {
-		if syncActivityEvent(evt) {
-			lastEvent.Store(time.Now().UTC().UnixNano())
-		}
-
-		switch v := evt.(type) {
-		case *events.Message:
-			pm := wa.ParseLiveMessage(v)
-			if pm.ReactionToID != "" && pm.ReactionEmoji == "" && v.Message != nil && v.Message.GetEncReactionMessage() != nil {
-				if reaction, err := a.wa.DecryptReaction(ctx, v); err == nil && reaction != nil {
-					pm.ReactionEmoji = reaction.GetText()
-					if pm.ReactionToID == "" {
-						if key := reaction.GetKey(); key != nil {
-							pm.ReactionToID = key.GetID()
-						}
-					}
-				}
-			}
-			if err := a.storeParsedMessage(ctx, pm); err == nil {
-				messagesStored.Add(1)
-			}
-			if opts.DownloadMedia && pm.Media != nil && pm.ID != "" {
-				enqueueMedia(pm.Chat.String(), pm.ID)
-			}
-			if messagesStored.Load()%25 == 0 {
-				fmt.Fprintf(os.Stderr, "\rSynced %d messages...", messagesStored.Load())
-			}
-		case *events.HistorySync:
-			fmt.Fprintf(os.Stderr, "\nProcessing history sync (%d conversations)...\n", len(v.Data.Conversations))
-			for _, conv := range v.Data.Conversations {
-				lastEvent.Store(time.Now().UTC().UnixNano())
-				chatID := strings.TrimSpace(conv.GetID())
-				if chatID == "" {
-					continue
-				}
-				for _, m := range conv.Messages {
-					lastEvent.Store(time.Now().UTC().UnixNano())
-					if m.Message == nil {
-						continue
-					}
-					pm := wa.ParseHistoryMessage(chatID, m.Message)
-					if pm.ID == "" || pm.Chat.IsEmpty() {
-						continue
-					}
-					if err := a.storeParsedMessage(ctx, pm); err == nil {
-						messagesStored.Add(1)
-					}
-					if opts.DownloadMedia && pm.Media != nil && pm.ID != "" {
-						enqueueMedia(pm.Chat.String(), pm.ID)
-					}
-				}
-			}
-			fmt.Fprintf(os.Stderr, "\rSynced %d messages...", messagesStored.Load())
-		case *events.Star:
-			if v == nil || v.Action == nil {
-				return
-			}
-			_ = a.db.SetStarred(v.ChatJID.String(), v.SenderJID.String(), v.MessageID, v.Action.GetStarred(), v.Timestamp)
-		case *events.Connected:
-			fmt.Fprintln(os.Stderr, "\nConnected.")
-		case *events.Disconnected:
-			fmt.Fprintln(os.Stderr, "\nDisconnected.")
-			select {
-			case disconnected <- struct{}{}:
-			default:
-			}
-		case *events.KeepAliveTimeout:
-			handleKeepAliveTimeout(opts, v, staleReconnect)
-		case *events.StreamReplaced:
-			fmt.Fprintln(os.Stderr, "\nStream replaced (another client connected with this session).")
-			// whatsmeow emits StreamReplaced before onDisconnect necessarily
-			// clears the socket, so force-close before reconnecting.
-			a.wa.Close()
-			select {
-			case disconnected <- struct{}{}:
-			default:
-			}
-		case *events.LoggedOut:
-			fmt.Fprintf(os.Stderr, "\nLogged out by server (%s); the session was removed. Run `wacli auth` to re-link.\n", v.Reason)
-			reportFatal(fmt.Errorf("logged out by server: %s", v.Reason))
-		case *events.TemporaryBan:
-			fmt.Fprintf(os.Stderr, "\n%s\n", v.String())
-			reportFatal(fmt.Errorf("temporarily banned: %s", v.Code))
-		case *events.ClientOutdated:
-			fmt.Fprintln(os.Stderr, "\nWhatsApp rejected the connection: client outdated. Update wacli (whatsmeow).")
-			reportFatal(fmt.Errorf("client outdated; update wacli"))
-		case *events.ConnectFailure:
-			fmt.Fprintf(os.Stderr, "\nConnection failure: %s (%s)\n", v.Reason, v.Message)
-			reportFatal(fmt.Errorf("connection failure: %s", v.Reason))
-		case *events.StreamError:
-			fmt.Fprintf(os.Stderr, "\nStream error (code %s).\n", v.Code)
-		}
-	})
-	defer a.wa.RemoveEventHandler(handlerID)
-
-	if err := a.Connect(ctx, opts.AllowQR, opts.OnQRCode); err != nil {
-		return SyncResult{}, err
-	}
-	connectionEpoch.Store(time.Now().UTC().UnixNano())
 
 	if opts.DownloadMedia {
 		var err error
-		stopMedia, err = a.runMediaWorkers(ctx, mediaJobs, 4)
+		stopMedia, err = a.runMediaWorkers(syncCtx, mediaJobs, 4)
 		if err != nil {
 			return SyncResult{}, err
 		}
 		defer stopMedia()
 	}
 
+	var stopWebhook func()
+	var webhookJobs chan wa.ParsedMessage
+	enqueueWebhook := func(wa.ParsedMessage) {}
+	if syncWebhookEnabled(opts) {
+		webhookJobs = make(chan wa.ParsedMessage, 512)
+		enqueueWebhook = a.newSyncWebhookEnqueuer(syncCtx, webhookJobs)
+		stopWebhook = a.runSyncWebhookWorker(syncCtx, opts, webhookJobs)
+		defer stopWebhook()
+	}
+
+	ps := &syncPresence{}
+	handlerID := a.addSyncEventHandler(syncCtx, opts, &messagesStored, &lastEvent, disconnected, staleReconnect, reportFatal, enqueueMedia, enqueueWebhook, limits, ps)
+	defer a.wa.RemoveEventHandler(handlerID)
+
+	connectionEpoch.Store(nowUTC().UnixNano())
+	if err := a.connectForSync(syncCtx, opts); err != nil {
+		return SyncResult{}, err
+	}
+	// Ensure unavailable presence is sent on ALL post-connect exits
+	// (success, error, storage limit, reconnect failure), not just the
+	// success path. The websocket stays alive via DetachSocket, so the
+	// send can complete even after the sync context is cancelled.
+	defer func() {
+		ps.mu.Lock()
+		ps.cleanupStarted = true
+		ps.mu.Unlock()
+		a.wa.RemoveEventHandler(handlerID)
+		a.sendPresenceBounded(types.PresenceUnavailable)
+	}()
+	now = nowUTC().UnixNano()
+	lastEvent.Store(now)
+	if err := a.migrateHistoricalLIDs(syncCtx); err != nil {
+		return SyncResult{MessagesStored: messagesStored.Load()}, err
+	}
+	a.syncAppStateDeltas(syncCtx)
+
 	// Optional: bootstrap imports (helps contacts/groups management without waiting for events).
 	if opts.RefreshContacts {
-		_ = a.refreshContacts(ctx)
+		if err := a.refreshContacts(syncCtx); err != nil {
+			a.emitWarning(
+				"refresh_contacts_failed",
+				fmt.Sprintf("warning: failed to refresh contacts: %v", err),
+				map[string]any{"error": err.Error()},
+			)
+		}
 	}
 	if opts.RefreshGroups {
-		_ = a.refreshGroups(ctx)
+		if err := a.refreshGroups(syncCtx); err != nil {
+			a.emitWarning(
+				"refresh_groups_failed",
+				fmt.Sprintf("warning: failed to refresh groups: %v", err),
+				map[string]any{"error": err.Error()},
+			)
+		}
+	}
+	if opts.RefreshChannels {
+		if err := a.refreshNewsletters(syncCtx); err != nil {
+			a.emitWarning(
+				"refresh_channels_failed",
+				fmt.Sprintf("warning: failed to refresh channels: %v", err),
+				map[string]any{"error": err.Error()},
+			)
+		}
 	}
 	if opts.AfterConnect != nil {
-		if err := opts.AfterConnect(ctx); err != nil {
+		if err := opts.AfterConnect(syncCtx); err != nil {
 			return SyncResult{MessagesStored: messagesStored.Load()}, err
 		}
 	}
 
+	var err error
 	if opts.Mode == SyncModeFollow {
-		for {
-			select {
-			case <-ctx.Done():
-				fmt.Fprintln(os.Stderr, "\nStopping sync.")
-				return SyncResult{MessagesStored: messagesStored.Load()}, nil
-			case err := <-fatal:
-				return SyncResult{MessagesStored: messagesStored.Load()}, err
-			case req := <-staleReconnect:
-				// Ignore stale reports from a previous connection.
-				if epoch := connectionEpoch.Load(); epoch > 0 && req.lastSuccess.Before(time.Unix(0, epoch)) {
-					continue
-				}
-				fmt.Fprintf(os.Stderr, "\nKeepalive has been failing for %s (threshold %s, %d errors), reconnecting...\n", req.idle, req.threshold, req.errorCount)
-				// Force-close so the reconnect starts from a clean socket.
-				a.wa.Close()
-				connectionEpoch.Store(time.Now().UTC().UnixNano())
-				if err := a.wa.ReconnectWithBackoff(ctx, 2*time.Second, 30*time.Second); err != nil {
-					return SyncResult{MessagesStored: messagesStored.Load()}, err
-				}
-			case <-disconnected:
-				fmt.Fprintln(os.Stderr, "Reconnecting...")
-				connectionEpoch.Store(time.Now().UTC().UnixNano())
-				if err := a.wa.ReconnectWithBackoff(ctx, 2*time.Second, 30*time.Second); err != nil {
-					return SyncResult{MessagesStored: messagesStored.Load()}, err
-				}
-			}
-		}
+		_, err = a.runSyncFollow(syncCtx, opts.MaxReconnect, &messagesStored, &connectionEpoch, disconnected, staleReconnect, fatal)
+	} else {
+		_, err = a.runSyncUntilIdle(syncCtx, opts.IdleExit, opts.MaxReconnect, &messagesStored, &lastEvent, disconnected, fatal)
 	}
+	if limitErr := limits.Err(); limitErr != nil {
+		return SyncResult{MessagesStored: messagesStored.Load()}, limitErr
+	}
+	if err != nil {
+		return SyncResult{MessagesStored: messagesStored.Load()}, err
+	}
+	return SyncResult{MessagesStored: messagesStored.Load()}, nil
+}
 
-	// Bootstrap/once: exit after idle.
-	poll := 250 * time.Millisecond
-	if opts.IdleExit >= 2*time.Second {
-		poll = 1 * time.Second
-	}
-	ticker := time.NewTicker(poll)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			fmt.Fprintln(os.Stderr, "\nStopping sync.")
-			return SyncResult{MessagesStored: messagesStored.Load()}, nil
-		case err := <-fatal:
-			return SyncResult{MessagesStored: messagesStored.Load()}, err
-		case <-disconnected:
-			fmt.Fprintln(os.Stderr, "Reconnecting...")
-			connectionEpoch.Store(time.Now().UTC().UnixNano())
-			if err := a.wa.ReconnectWithBackoff(ctx, 2*time.Second, 30*time.Second); err != nil {
-				return SyncResult{MessagesStored: messagesStored.Load()}, err
-			}
-		case <-ticker.C:
-			last := time.Unix(0, lastEvent.Load())
-			if time.Since(last) >= opts.IdleExit {
-				fmt.Fprintf(os.Stderr, "\nIdle for %s, exiting.\n", opts.IdleExit)
-				return SyncResult{MessagesStored: messagesStored.Load()}, nil
-			}
+func (a *App) syncAppStateDeltas(ctx context.Context) {
+	for _, name := range []appstate.WAPatchName{appstate.WAPatchRegularHigh, appstate.WAPatchRegularLow, appstate.WAPatchRegular} {
+		fullSync := name == appstate.WAPatchRegular
+		if err := a.wa.FetchAppState(ctx, string(name), fullSync, false); err != nil {
+			a.emitWarning(
+				"app_state_sync_failed",
+				fmt.Sprintf("warning: failed to sync WhatsApp app state %s: %v", name, err),
+				map[string]any{"name": string(name), "error": err.Error()},
+			)
 		}
 	}
 }
 
+func (a *App) connectForSync(ctx context.Context, opts SyncOptions) error {
+	connectOpts := wa.ConnectOptions{
+		AllowQR:         opts.AllowQR,
+		OnQRCode:        opts.OnQRCode,
+		PairPhoneNumber: opts.PairPhoneNumber,
+		OnPairCode:      opts.OnPairCode,
+		// Only detach for already-authenticated sync, not for auth
+		// bootstrap (AllowQR / phone pairing) where caller
+		// cancellation must bound the QR/pairing flow.
+		DetachSocket: opts.AllowQR == false && opts.PairPhoneNumber == "",
+	}
+
+	attempts := 1
+	if opts.AllowQR || opts.PairPhoneNumber != "" {
+		attempts = maxAuthConnectAttempts
+	}
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err := a.wa.Connect(ctx, connectOpts)
+		if err == nil {
+			return nil
+		}
+		if attempt == attempts || ctx.Err() != nil || !isRetryableAuthConnectError(err) {
+			return err
+		}
+		a.emitWarning(
+			"auth_connect_retry",
+			fmt.Sprintf("warning: auth connection dropped before pairing completed; retrying (%d/%d)", attempt+1, attempts),
+			map[string]any{"attempt": attempt + 1, "attempts": attempts},
+		)
+		select {
+		case <-time.After(authConnectRetryDelay(attempt)):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func authConnectRetryDelay(attempt int) time.Duration {
+	return time.Duration(attempt) * 500 * time.Millisecond
+}
+
+func isRetryableAuthConnectError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, needle := range []string{
+		"qr code timed out",
+		"qr channel closed",
+		"websocket",
+		"failed to read frame header",
+		"connection reset",
+		"broken pipe",
+		"i/o timeout",
+		"eof",
+	} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) checkSyncStorageLimits(opts SyncOptions) error {
+	if opts.MaxMessages > 0 {
+		count, err := a.db.CountMessages()
+		if err != nil {
+			return fmt.Errorf("check message limit: %w", err)
+		}
+		if count >= opts.MaxMessages {
+			return syncStorageLimitError("message", count, opts.MaxMessages)
+		}
+	}
+	if opts.MaxDBSizeBytes > 0 {
+		size, err := a.dbDiskSize()
+		if err != nil {
+			return fmt.Errorf("check database size limit: %w", err)
+		}
+		if size >= opts.MaxDBSizeBytes {
+			return syncStorageLimitError("database size", size, opts.MaxDBSizeBytes)
+		}
+	}
+	return nil
+}
+
+func (a *App) dbDiskSize() (int64, error) {
+	var total int64
+	for _, path := range []string{
+		filepath.Join(a.opts.StoreDir, "wacli.db"),
+		filepath.Join(a.opts.StoreDir, "wacli.db-wal"),
+		filepath.Join(a.opts.StoreDir, "wacli.db-shm"),
+	} {
+		info, err := os.Stat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return 0, err
+		}
+		if !info.IsDir() {
+			total += info.Size()
+		}
+	}
+	return total, nil
+}
+
+func syncStorageLimitError(kind string, got, limit int64) error {
+	return fmt.Errorf("sync storage limit reached: %s is %d, limit is %d", kind, got, limit)
+}
+
 func chatKind(chat types.JID) string {
+	if chat.Server == types.NewsletterServer {
+		return "newsletter"
+	}
 	if chat.Server == types.GroupServer {
 		return "group"
 	}
 	if chat.IsBroadcastList() {
 		return "broadcast"
 	}
-	if chat.Server == types.DefaultUserServer || chat.Server == types.HiddenUserServer {
+	if chat.Server == types.DefaultUserServer {
 		return "dm"
 	}
 	return "unknown"
 }
 
 func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error {
-	chatJID := pm.Chat.String()
+	pm.Chat = a.canonicalStoreJID(ctx, pm.Chat)
+	chatJID := canonicalJIDString(pm.Chat)
 	chatName := a.wa.ResolveChatName(ctx, pm.Chat, pm.PushName)
-	if err := a.db.UpsertChat(chatJID, chatKind(pm.Chat), chatName, pm.Timestamp); err != nil {
-		return err
+	if pm.Chat != types.StatusBroadcastJID {
+		if err := a.db.UpsertChat(chatJID, chatKind(pm.Chat), chatName, pm.Timestamp); err != nil {
+			return err
+		}
 	}
 
 	// Best-effort: store contact info for DMs.
 	if pm.Chat.Server == types.DefaultUserServer {
-		if info, err := a.wa.GetContact(ctx, pm.Chat.ToNonAD()); err == nil {
+		chat := canonicalJID(pm.Chat)
+		if info, err := a.wa.GetContact(ctx, chat); err == nil {
 			_ = a.db.UpsertContact(
-				pm.Chat.String(),
-				pm.Chat.User,
+				chat.String(),
+				chat.User,
 				info.PushName,
 				info.FullName,
 				info.FirstName,
@@ -385,15 +398,18 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 	} else if s := strings.TrimSpace(pm.PushName); s != "" && s != "-" {
 		senderName = s
 	}
+	senderJID := pm.SenderJID
 	if pm.SenderJID != "" {
 		if jid, err := types.ParseJID(pm.SenderJID); err == nil {
-			if info, err := a.wa.GetContact(ctx, jid.ToNonAD()); err == nil {
+			contactJID := a.canonicalStoreJID(ctx, jid)
+			senderJID = contactJID.String()
+			if info, err := a.wa.GetContact(ctx, contactJID); err == nil {
 				if name := wa.BestContactName(info); name != "" {
 					senderName = name
 				}
 				_ = a.db.UpsertContact(
-					jid.String(),
-					jid.User,
+					contactJID.String(),
+					contactJID.User,
 					info.PushName,
 					info.FullName,
 					info.FirstName,
@@ -406,7 +422,7 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 	// Best-effort: store group metadata (and participants) when available.
 	if pm.Chat.Server == types.GroupServer {
 		if gi, err := a.wa.GetGroupInfo(ctx, pm.Chat); err == nil && gi != nil {
-			_ = a.db.UpsertGroup(gi.JID.String(), gi.GroupName.Name, gi.OwnerJID.String(), gi.GroupCreated)
+			_ = a.db.UpsertGroupWithHierarchy(gi.JID.String(), gi.GroupName.Name, gi.OwnerJID.String(), gi.GroupCreated, gi.IsParent, gi.LinkedParentJID.String())
 			var ps []store.GroupParticipant
 			for _, p := range gi.Participants {
 				role := "member"
@@ -417,7 +433,7 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 				}
 				ps = append(ps, store.GroupParticipant{
 					GroupJID: pm.Chat.String(),
-					UserJID:  p.JID.String(),
+					UserJID:  canonicalJIDString(p.JID),
 					Role:     role,
 				})
 			}
@@ -440,28 +456,180 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 		fileLen = pm.Media.FileLength
 	}
 
-	displayText := a.buildDisplayText(ctx, pm)
+	if pm.Chat == types.StatusBroadcastJID {
+		return a.db.UpsertStatusMessage(store.UpsertStatusMessageParams{
+			MsgID:         pm.ID,
+			Timestamp:     pm.Timestamp,
+			FromMe:        pm.FromMe,
+			SenderJID:     senderJID,
+			SenderName:    senderName,
+			Text:          pm.Text,
+			MediaType:     mediaType,
+			MediaCaption:  caption,
+			Filename:      filename,
+			MimeType:      mimeType,
+			DirectPath:    directPath,
+			MediaKey:      mediaKey,
+			FileSHA256:    fileSha,
+			FileEncSHA256: fileEncSha,
+			FileLength:    fileLen,
+		})
+	}
 
-	return a.db.UpsertMessage(store.UpsertMessageParams{
-		ChatJID:       chatJID,
-		ChatName:      chatName,
-		MsgID:         pm.ID,
-		SenderJID:     pm.SenderJID,
-		SenderName:    senderName,
-		Timestamp:     pm.Timestamp,
-		FromMe:        pm.FromMe,
-		Text:          pm.Text,
-		DisplayText:   displayText,
-		MediaType:     mediaType,
-		MediaCaption:  caption,
-		Filename:      filename,
-		MimeType:      mimeType,
-		DirectPath:    directPath,
-		MediaKey:      mediaKey,
-		FileSHA256:    fileSha,
-		FileEncSHA256: fileEncSha,
-		FileLength:    fileLen,
+	displayText := a.buildDisplayText(ctx, pm)
+	if pm.Revoked {
+		displayText = store.DeletedMessageDisplayText
+	}
+
+	if err := a.db.UpsertMessage(store.UpsertMessageParams{
+		ChatJID:         chatJID,
+		ChatName:        chatName,
+		MsgID:           pm.ID,
+		SenderJID:       senderJID,
+		SenderName:      senderName,
+		Timestamp:       pm.Timestamp,
+		FromMe:          pm.FromMe,
+		Text:            pm.Text,
+		DisplayText:     displayText,
+		QuotedMsgID:     pm.ReplyToID,
+		QuotedSenderJID: pm.ReplyToSenderJID,
+		Buttons:         waButtonsToStore(pm.Buttons),
+		IsForwarded:     pm.IsForwarded,
+		ForwardingScore: pm.ForwardingScore,
+		ReactionToID:    pm.ReactionToID,
+		ReactionEmoji:   pm.ReactionEmoji,
+		MediaType:       mediaType,
+		MediaCaption:    caption,
+		Filename:        filename,
+		MimeType:        mimeType,
+		DirectPath:      directPath,
+		MediaKey:        mediaKey,
+		FileSHA256:      fileSha,
+		FileEncSHA256:   fileEncSha,
+		FileLength:      fileLen,
+		Edited:          pm.Edited,
+		Revoked:         pm.Revoked,
+	}); err != nil {
+		return err
+	}
+	if pm.Call != nil {
+		pm.Call.Chat = pm.Chat
+		if pm.Call.SenderJID == "" {
+			pm.Call.SenderJID = senderJID
+		}
+		if pm.Call.Timestamp.IsZero() {
+			pm.Call.Timestamp = pm.Timestamp
+		}
+		if err := a.storeParsedCallEvent(ctx, *pm.Call, chatName, senderName); err != nil {
+			return err
+		}
+	}
+	if pm.StarredKnown {
+		return a.db.SetStarred(store.SetStarredParams{
+			ChatJID:   chatJID,
+			MsgID:     pm.ID,
+			SenderJID: senderJID,
+			FromMe:    pm.FromMe,
+			Starred:   pm.Starred,
+			StarredAt: pm.Timestamp,
+		})
+	}
+	return nil
+}
+
+func (a *App) storeParsedCallEvent(ctx context.Context, call wa.ParsedCallEvent, chatName, senderName string) error {
+	call.Chat = a.canonicalStoreJID(ctx, call.Chat)
+	chatJID := canonicalJIDString(call.Chat)
+	if chatJID == "" {
+		return fmt.Errorf("call chat JID is required")
+	}
+	if chatName == "" {
+		chatName = a.wa.ResolveChatName(ctx, call.Chat, "")
+	}
+	if err := a.db.UpsertChat(chatJID, chatKind(call.Chat), chatName, call.Timestamp); err != nil {
+		return err
+	}
+
+	senderJID := strings.TrimSpace(call.SenderJID)
+	if senderJID != "" {
+		if jid, err := types.ParseJID(senderJID); err == nil {
+			contactJID := a.canonicalStoreJID(ctx, jid)
+			senderJID = contactJID.String()
+			if senderName == "" {
+				if info, err := a.wa.GetContact(ctx, contactJID); err == nil {
+					senderName = wa.BestContactName(info)
+				}
+			}
+		}
+	}
+
+	participants := make([]store.CallParticipant, 0, len(call.Participants))
+	for _, p := range call.Participants {
+		jid := strings.TrimSpace(p.JID)
+		if jid != "" {
+			if parsed, err := types.ParseJID(jid); err == nil {
+				jid = canonicalJIDString(a.canonicalStoreJID(ctx, parsed))
+			}
+		}
+		if jid == "" {
+			continue
+		}
+		participants = append(participants, store.CallParticipant{
+			JID:     jid,
+			Outcome: p.Outcome,
+		})
+	}
+
+	return a.db.UpsertCallEvent(store.UpsertCallEventParams{
+		ChatJID:      chatJID,
+		ChatName:     chatName,
+		SenderJID:    senderJID,
+		SenderName:   senderName,
+		CallID:       call.CallID,
+		MsgID:        call.MsgID,
+		EventType:    call.EventType,
+		Direction:    call.Direction,
+		Media:        call.Media,
+		Outcome:      call.Outcome,
+		Reason:       call.Reason,
+		CallType:     call.CallType,
+		DurationSecs: call.DurationSecs,
+		Timestamp:    call.Timestamp,
+		Participants: participants,
 	})
+}
+
+func (a *App) deleteParsedCallEvents(ctx context.Context, deleted wa.ParsedCallDelete) error {
+	chat := a.canonicalStoreJID(ctx, deleted.Chat)
+	chatJID := canonicalJIDString(chat)
+	if chatJID == "" {
+		return fmt.Errorf("call chat JID is required")
+	}
+	_, err := a.db.DeleteCallEvents(store.DeleteCallEventsParams{
+		ChatJID:   chatJID,
+		Direction: deleted.Direction,
+	})
+	return err
+}
+
+func waButtonsToStore(buttons []wa.Button) []store.Button {
+	if len(buttons) == 0 {
+		return nil
+	}
+	out := make([]store.Button, len(buttons))
+	for i, b := range buttons {
+		out[i] = store.Button{
+			Type:         b.Type,
+			DisplayText:  b.DisplayText,
+			ID:           b.ID,
+			URL:          b.URL,
+			PhoneNumber:  b.PhoneNumber,
+			Description:  b.Description,
+			ResponseType: b.ResponseType,
+			Index:        b.Index,
+		}
+	}
+	return out
 }
 
 func (a *App) buildDisplayText(ctx context.Context, pm wa.ParsedMessage) string {
@@ -504,6 +672,9 @@ func (a *App) buildDisplayText(ctx context.Context, pm wa.ParsedMessage) string 
 }
 
 func baseDisplayText(pm wa.ParsedMessage) string {
+	if pm.Call != nil {
+		return callDisplayText(*pm.Call)
+	}
 	if pm.Media != nil {
 		return "Sent " + mediaLabel(pm.Media.Type)
 	}
@@ -511,6 +682,38 @@ func baseDisplayText(pm wa.ParsedMessage) string {
 		return text
 	}
 	return ""
+}
+
+func callDisplayText(call wa.ParsedCallEvent) string {
+	parts := []string{"WhatsApp"}
+	if call.Media != "" {
+		parts = append(parts, call.Media)
+	}
+	parts = append(parts, "call")
+	if call.Outcome != "" {
+		parts = append(parts, call.Outcome)
+	} else if call.EventType != "" && call.EventType != "call_log" {
+		parts = append(parts, call.EventType)
+	}
+	if call.DurationSecs > 0 {
+		parts = append(parts, fmt.Sprintf("(%s)", formatCallDuration(call.DurationSecs)))
+	}
+	return strings.Join(parts, " ")
+}
+
+func formatCallDuration(seconds int64) string {
+	if seconds <= 0 {
+		return ""
+	}
+	minutes := seconds / 60
+	secs := seconds % 60
+	if minutes <= 0 {
+		return fmt.Sprintf("%ds", secs)
+	}
+	if secs == 0 {
+		return fmt.Sprintf("%dm", minutes)
+	}
+	return fmt.Sprintf("%dm%02ds", minutes, secs)
 }
 
 func (a *App) lookupMessageDisplayText(chatJID, msgID string) string {

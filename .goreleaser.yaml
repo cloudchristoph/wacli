@@ -25,19 +25,23 @@ universal_binaries:
     ids:
       - wacli
     name_template: wacli
-    replace: true
+    replace: false
 
 archives:
   - id: default
-    format: tar.gz
+    formats:
+      - tar.gz
     name_template: >-
-      {{ .ProjectName }}-{{ if eq .Os "darwin" }}macos{{ else }}{{ .Os }}{{ end }}-{{ if eq .Arch "all" }}universal{{ else }}{{ .Arch }}{{ end }}
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ if eq .Arch "all" }}universal{{ else }}{{ .Arch }}{{ end }}
     files:
       - LICENSE
       - README.md
 
 checksum:
   name_template: checksums.txt
+
+release:
+  mode: replace
 
 changelog:
   sort: asc

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -21,19 +22,69 @@ type Media struct {
 	FileLength    uint64
 }
 
+type Button struct {
+	Type         string `json:"type"`
+	DisplayText  string `json:"display_text"`
+	ID           string `json:"id,omitempty"`
+	URL          string `json:"url,omitempty"`
+	PhoneNumber  string `json:"phone_number,omitempty"`
+	Description  string `json:"description,omitempty"`
+	ResponseType string `json:"response_type,omitempty"`
+	Index        int    `json:"index,omitempty"`
+}
+
+// Poll captures the question + option list extracted from an incoming
+// PollCreationMessage (any of V1/V2/V3/V4/V5/V6).
+type Poll struct {
+	Question        string
+	Options         []string
+	SelectableCount uint32
+}
+
+// PollVoteRef references the original poll a PollUpdateMessage is voting on.
+// Decryption of the vote happens later in the sync handler.
+type PollVoteRef struct {
+	PollMessageID string
+	PollChatJID   string
+	PollSenderJID string
+	SenderTsMS    int64
+}
+
+// PollAddOptionRef references an added option for an existing poll. Encrypted
+// add-option messages initially carry only the poll key; the option is filled
+// after decryption in the sync layer.
+type PollAddOptionRef struct {
+	PollMessageID string
+	PollChatJID   string
+	PollSenderJID string
+	Option        string
+}
+
 type ParsedMessage struct {
-	Chat           types.JID
-	ID             string
-	SenderJID      string
-	Timestamp      time.Time
-	FromMe         bool
-	Text           string
-	Media          *Media
-	PushName       string
-	ReplyToID      string
-	ReplyToDisplay string
-	ReactionToID   string
-	ReactionEmoji  string
+	Chat             types.JID
+	ID               string
+	SenderJID        string
+	Timestamp        time.Time
+	FromMe           bool
+	Text             string
+	Buttons          []Button
+	Media            *Media
+	Poll             *Poll
+	PollVote         *PollVoteRef
+	PollAdd          *PollAddOptionRef
+	PushName         string
+	ReplyToID        string
+	ReplyToSenderJID string
+	ReplyToDisplay   string
+	ReactionToID     string
+	ReactionEmoji    string
+	IsForwarded      bool
+	ForwardingScore  uint32
+	StarredKnown     bool
+	Starred          bool
+	Edited           bool
+	Revoked          bool
+	Call             *ParsedCallEvent
 }
 
 func ParseLiveMessage(evt *events.Message) ParsedMessage {
@@ -46,6 +97,9 @@ func ParseLiveMessage(evt *events.Message) ParsedMessage {
 	}
 	if s := evt.Info.Sender.String(); s != "" {
 		msg.SenderJID = s
+	}
+	if evt.Info.DeviceSentMeta != nil {
+		applyDeviceSentDestination(evt.Info.DeviceSentMeta.DestinationJID, &msg)
 	}
 
 	extractWAProto(evt.Message, &msg)
@@ -63,6 +117,10 @@ func ParseHistoryMessage(chatJID string, hist *waProto.WebMessageInfo) ParsedMes
 		ID:        hist.GetKey().GetID(),
 		Timestamp: time.Unix(int64(hist.GetMessageTimestamp()), 0).UTC(),
 		FromMe:    hist.GetKey().GetFromMe(),
+	}
+	if hist.Starred != nil {
+		pm.StarredKnown = true
+		pm.Starred = hist.GetStarred()
 	}
 
 	// Prefer top-level participant (works for LID-addressed groups),
@@ -88,6 +146,106 @@ func extractWAProto(m *waProto.Message, pm *ParsedMessage) {
 		return
 	}
 
+	if deviceSent := m.GetDeviceSentMessage(); deviceSent.GetMessage() != nil {
+		applyDeviceSentDestination(deviceSent.GetDestinationJID(), pm)
+		extractWAProto(deviceSent.GetMessage(), pm)
+		return
+	}
+	if edited := m.GetEditedMessage().GetMessage(); edited != nil {
+		if edited.MessageContextInfo == nil && m.MessageContextInfo != nil {
+			edited.MessageContextInfo = m.MessageContextInfo
+		}
+		pm.Edited = true
+		extractWAProto(edited, pm)
+		return
+	}
+	if replacement, handled := extractProtocolMutation(m, pm); handled {
+		if replacement != nil {
+			extractWAProto(replacement, pm)
+		}
+		return
+	}
+	extractReaction(m, pm)
+	extractPlainText(m, pm)
+	extractMedia(m, pm)
+	extractContactText(m, pm)
+	extractBusinessText(m, pm)
+	extractPoll(m, pm)
+	extractPollAddOption(m, pm)
+	extractPollUpdate(m, pm)
+	extractCallLog(m, pm)
+
+	if ctx := contextInfoForMessage(m); ctx != nil {
+		if id := strings.TrimSpace(ctx.GetStanzaID()); id != "" {
+			pm.ReplyToID = id
+		}
+		if sender := strings.TrimSpace(ctx.GetParticipant()); sender != "" {
+			pm.ReplyToSenderJID = sender
+		}
+		if quoted := ctx.GetQuotedMessage(); quoted != nil {
+			pm.ReplyToDisplay = strings.TrimSpace(displayTextForProto(quoted))
+		}
+		pm.ForwardingScore = ctx.GetForwardingScore()
+		pm.IsForwarded = ctx.GetIsForwarded() || pm.ForwardingScore > 0
+	}
+}
+
+func applyDeviceSentDestination(destination string, pm *ParsedMessage) {
+	if pm == nil {
+		return
+	}
+	pm.FromMe = true
+	if chat, err := types.ParseJID(strings.TrimSpace(destination)); err == nil && !chat.IsEmpty() {
+		pm.Chat = chat
+	}
+}
+
+func extractProtocolMutation(m *waProto.Message, pm *ParsedMessage) (*waProto.Message, bool) {
+	protocol := m.GetProtocolMessage()
+	if protocol == nil {
+		return nil, false
+	}
+	switch protocol.GetType() {
+	case waProto.ProtocolMessage_MESSAGE_EDIT:
+		applyProtocolKey(protocol.GetKey(), pm)
+		pm.Edited = true
+		return protocol.GetEditedMessage(), true
+	case waProto.ProtocolMessage_REVOKE:
+		key := protocol.GetKey()
+		if key == nil {
+			return nil, false
+		}
+		applyProtocolKey(key, pm)
+		pm.Text = ""
+		pm.Media = nil
+		pm.Revoked = true
+		return nil, true
+	default:
+		return nil, false
+	}
+}
+
+func applyProtocolKey(key *waProto.MessageKey, pm *ParsedMessage) {
+	if key == nil || pm == nil {
+		return
+	}
+	if id := strings.TrimSpace(key.GetID()); id != "" {
+		pm.ID = id
+	}
+	if remote := strings.TrimSpace(key.GetRemoteJID()); remote != "" {
+		if chat, err := types.ParseJID(remote); err == nil {
+			pm.Chat = chat
+		}
+	}
+	if participant := strings.TrimSpace(key.GetParticipant()); participant != "" {
+		pm.SenderJID = participant
+	}
+	if key.FromMe != nil {
+		pm.FromMe = key.GetFromMe()
+	}
+}
+
+func extractReaction(m *waProto.Message, pm *ParsedMessage) {
 	if reaction := m.GetReactionMessage(); reaction != nil {
 		pm.ReactionEmoji = reaction.GetText()
 		if key := reaction.GetKey(); key != nil {
@@ -98,102 +256,129 @@ func extractWAProto(m *waProto.Message, pm *ParsedMessage) {
 			pm.ReactionToID = key.GetID()
 		}
 	}
+}
 
+func extractPoll(m *waProto.Message, pm *ParsedMessage) {
+	creation := pickPollCreation(m)
+	if creation == nil {
+		return
+	}
+	question := strings.TrimSpace(creation.GetName())
+	options := make([]string, 0, len(creation.GetOptions()))
+	for _, opt := range creation.GetOptions() {
+		options = append(options, opt.GetOptionName())
+	}
+	pm.Poll = &Poll{
+		Question:        question,
+		Options:         options,
+		SelectableCount: creation.GetSelectableOptionsCount(),
+	}
+	if pm.Text == "" && question != "" {
+		pm.Text = "Poll: " + question
+	}
+}
+
+// pickPollCreation returns the inner PollCreationMessage from any of the
+// known V1/V2/V3/V4/V5/V6 fields, including FutureProofMessage wrappers.
+func pickPollCreation(m *waProto.Message) *waProto.PollCreationMessage {
+	if m == nil {
+		return nil
+	}
+	if c := m.GetPollCreationMessage(); c != nil {
+		return c
+	}
+	if c := m.GetPollCreationMessageV2(); c != nil {
+		return c
+	}
+	if c := m.GetPollCreationMessageV3(); c != nil {
+		return c
+	}
+	if c := m.GetPollCreationMessageV5(); c != nil {
+		return c
+	}
+	if c := m.GetPollCreationMessageV6(); c != nil {
+		return c
+	}
+	if fp := m.GetPollCreationMessageV4(); fp != nil {
+		if inner := fp.GetMessage(); inner != nil {
+			if c := inner.GetPollCreationMessage(); c != nil {
+				return c
+			}
+			if c := inner.GetPollCreationMessageV2(); c != nil {
+				return c
+			}
+			if c := inner.GetPollCreationMessageV3(); c != nil {
+				return c
+			}
+			if c := inner.GetPollCreationMessageV5(); c != nil {
+				return c
+			}
+			if c := inner.GetPollCreationMessageV6(); c != nil {
+				return c
+			}
+		}
+	}
+	return nil
+}
+
+func extractPollUpdate(m *waProto.Message, pm *ParsedMessage) {
+	update := m.GetPollUpdateMessage()
+	if update == nil {
+		return
+	}
+	key := update.GetPollCreationMessageKey()
+	ref := &PollVoteRef{}
+	if key != nil {
+		ref.PollMessageID = strings.TrimSpace(key.GetID())
+		ref.PollChatJID = strings.TrimSpace(key.GetRemoteJID())
+		ref.PollSenderJID = strings.TrimSpace(key.GetParticipant())
+	}
+	ref.SenderTsMS = update.GetSenderTimestampMS()
+	pm.PollVote = ref
+	if pm.Text == "" {
+		pm.Text = "Poll vote"
+	}
+}
+
+func extractPollAddOption(m *waProto.Message, pm *ParsedMessage) {
+	add := m.GetPollAddOptionMessage()
+	if add != nil {
+		pm.PollAdd = pollAddOptionRef(add.GetPollCreationMessageKey(), add.GetAddOption().GetOptionName())
+		if pm.Text == "" {
+			pm.Text = "Poll option added"
+		}
+		return
+	}
+	secret := m.GetSecretEncryptedMessage()
+	if secret == nil || secret.GetSecretEncType() != waE2E.SecretEncryptedMessage_POLL_ADD_OPTION {
+		return
+	}
+	pm.PollAdd = pollAddOptionRef(secret.GetTargetMessageKey(), "")
+	if pm.Text == "" {
+		pm.Text = "Poll option added"
+	}
+}
+
+func pollAddOptionRef(key interface {
+	GetID() string
+	GetRemoteJID() string
+	GetParticipant() string
+}, option string) *PollAddOptionRef {
+	ref := &PollAddOptionRef{Option: strings.TrimSpace(option)}
+	if key != nil {
+		ref.PollMessageID = strings.TrimSpace(key.GetID())
+		ref.PollChatJID = strings.TrimSpace(key.GetRemoteJID())
+		ref.PollSenderJID = strings.TrimSpace(key.GetParticipant())
+	}
+	return ref
+}
+
+func extractPlainText(m *waProto.Message, pm *ParsedMessage) {
 	switch {
 	case m.GetConversation() != "":
 		pm.Text = m.GetConversation()
 	case m.GetExtendedTextMessage() != nil:
 		pm.Text = m.GetExtendedTextMessage().GetText()
-	}
-
-	if img := m.GetImageMessage(); img != nil {
-		if pm.Text == "" {
-			pm.Text = img.GetCaption()
-		}
-		pm.Media = &Media{
-			Type:          "image",
-			Caption:       img.GetCaption(),
-			MimeType:      img.GetMimetype(),
-			DirectPath:    img.GetDirectPath(),
-			MediaKey:      clone(img.GetMediaKey()),
-			FileSHA256:    clone(img.GetFileSHA256()),
-			FileEncSHA256: clone(img.GetFileEncSHA256()),
-			FileLength:    img.GetFileLength(),
-		}
-	}
-
-	if vid := m.GetVideoMessage(); vid != nil {
-		if pm.Text == "" {
-			pm.Text = vid.GetCaption()
-		}
-		mediaType := "video"
-		if vid.GetGifPlayback() {
-			mediaType = "gif"
-		}
-		pm.Media = &Media{
-			Type:          mediaType,
-			Caption:       vid.GetCaption(),
-			MimeType:      vid.GetMimetype(),
-			DirectPath:    vid.GetDirectPath(),
-			MediaKey:      clone(vid.GetMediaKey()),
-			FileSHA256:    clone(vid.GetFileSHA256()),
-			FileEncSHA256: clone(vid.GetFileEncSHA256()),
-			FileLength:    vid.GetFileLength(),
-		}
-	}
-
-	if aud := m.GetAudioMessage(); aud != nil {
-		if pm.Text == "" {
-			pm.Text = "[Audio]"
-		}
-		pm.Media = &Media{
-			Type:          "audio",
-			Caption:       pm.Text,
-			MimeType:      aud.GetMimetype(),
-			DirectPath:    aud.GetDirectPath(),
-			MediaKey:      clone(aud.GetMediaKey()),
-			FileSHA256:    clone(aud.GetFileSHA256()),
-			FileEncSHA256: clone(aud.GetFileEncSHA256()),
-			FileLength:    aud.GetFileLength(),
-		}
-	}
-
-	if doc := m.GetDocumentMessage(); doc != nil {
-		if pm.Text == "" {
-			pm.Text = doc.GetCaption()
-		}
-		pm.Media = &Media{
-			Type:          "document",
-			Caption:       doc.GetCaption(),
-			Filename:      doc.GetFileName(),
-			MimeType:      doc.GetMimetype(),
-			DirectPath:    doc.GetDirectPath(),
-			MediaKey:      clone(doc.GetMediaKey()),
-			FileSHA256:    clone(doc.GetFileSHA256()),
-			FileEncSHA256: clone(doc.GetFileEncSHA256()),
-			FileLength:    doc.GetFileLength(),
-		}
-	}
-
-	if sticker := m.GetStickerMessage(); sticker != nil {
-		pm.Media = &Media{
-			Type:          "sticker",
-			MimeType:      sticker.GetMimetype(),
-			DirectPath:    sticker.GetDirectPath(),
-			MediaKey:      clone(sticker.GetMediaKey()),
-			FileSHA256:    clone(sticker.GetFileSHA256()),
-			FileEncSHA256: clone(sticker.GetFileEncSHA256()),
-			FileLength:    sticker.GetFileLength(),
-		}
-	}
-
-	if ctx := contextInfoForMessage(m); ctx != nil {
-		if id := strings.TrimSpace(ctx.GetStanzaID()); id != "" {
-			pm.ReplyToID = id
-		}
-		if quoted := ctx.GetQuotedMessage(); quoted != nil {
-			pm.ReplyToDisplay = strings.TrimSpace(displayTextForProto(quoted))
-		}
 	}
 }
 
@@ -204,82 +389,4 @@ func clone(b []byte) []byte {
 	out := make([]byte, len(b))
 	copy(out, b)
 	return out
-}
-
-func contextInfoForMessage(m *waProto.Message) *waProto.ContextInfo {
-	if m == nil {
-		return nil
-	}
-	if ext := m.GetExtendedTextMessage(); ext != nil {
-		return ext.GetContextInfo()
-	}
-	if img := m.GetImageMessage(); img != nil {
-		return img.GetContextInfo()
-	}
-	if vid := m.GetVideoMessage(); vid != nil {
-		return vid.GetContextInfo()
-	}
-	if aud := m.GetAudioMessage(); aud != nil {
-		return aud.GetContextInfo()
-	}
-	if doc := m.GetDocumentMessage(); doc != nil {
-		return doc.GetContextInfo()
-	}
-	if sticker := m.GetStickerMessage(); sticker != nil {
-		return sticker.GetContextInfo()
-	}
-	if loc := m.GetLocationMessage(); loc != nil {
-		return loc.GetContextInfo()
-	}
-	if contact := m.GetContactMessage(); contact != nil {
-		return contact.GetContextInfo()
-	}
-	if contacts := m.GetContactsArrayMessage(); contacts != nil {
-		return contacts.GetContextInfo()
-	}
-	return nil
-}
-
-func displayTextForProto(m *waProto.Message) string {
-	if m == nil {
-		return ""
-	}
-
-	if img := m.GetImageMessage(); img != nil {
-		return "Sent image"
-	}
-	if vid := m.GetVideoMessage(); vid != nil {
-		if vid.GetGifPlayback() {
-			return "Sent gif"
-		}
-		return "Sent video"
-	}
-	if aud := m.GetAudioMessage(); aud != nil {
-		return "Sent audio"
-	}
-	if doc := m.GetDocumentMessage(); doc != nil {
-		return "Sent document"
-	}
-	if sticker := m.GetStickerMessage(); sticker != nil {
-		return "Sent sticker"
-	}
-	if loc := m.GetLocationMessage(); loc != nil {
-		return "Sent location"
-	}
-	if contact := m.GetContactMessage(); contact != nil {
-		return "Sent contact"
-	}
-	if contacts := m.GetContactsArrayMessage(); contacts != nil {
-		return "Sent contacts"
-	}
-
-	if text := strings.TrimSpace(m.GetConversation()); text != "" {
-		return text
-	}
-	if ext := m.GetExtendedTextMessage(); ext != nil {
-		if text := strings.TrimSpace(ext.GetText()); text != "" {
-			return text
-		}
-	}
-	return ""
 }

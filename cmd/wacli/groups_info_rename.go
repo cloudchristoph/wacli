@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/openclaw/wacli/internal/out"
 	"github.com/spf13/cobra"
-	"github.com/steipete/wacli/internal/out"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -20,6 +20,9 @@ func newGroupsInfoCmd(flags *rootFlags) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if strings.TrimSpace(jidStr) == "" {
 				return fmt.Errorf("--jid is required")
+			}
+			if err := flags.requireWritable(); err != nil {
+				return err
 			}
 			ctx, cancel := withTimeout(context.Background(), flags)
 			defer cancel()
@@ -45,6 +48,9 @@ func newGroupsInfoCmd(flags *rootFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if info == nil {
+				return fmt.Errorf("group info not found for %s", gjid.String())
+			}
 			if info != nil {
 				_ = persistGroupInfo(a.DB(), info)
 			}
@@ -53,10 +59,16 @@ func newGroupsInfoCmd(flags *rootFlags) *cobra.Command {
 				return out.WriteJSON(os.Stdout, info)
 			}
 
-			fmt.Fprintf(os.Stdout, "JID: %s\nName: %s\nOwner: %s\nCreated: %s\nParticipants: %d\n",
+			fmt.Fprintf(os.Stdout, "JID: %s\nName: %s\nOwner: %s\nType: %s\n",
 				info.JID.String(),
-				info.GroupName.Name,
+				sanitize(info.GroupName.Name),
 				info.OwnerJID.String(),
+				groupKindLabel(info.IsParent, info.LinkedParentJID.String()),
+			)
+			if !info.LinkedParentJID.IsEmpty() {
+				fmt.Fprintf(os.Stdout, "Parent: %s\n", info.LinkedParentJID.String())
+			}
+			fmt.Fprintf(os.Stdout, "Created: %s\nParticipants: %d\n",
 				info.GroupCreated.Local().Format(time.RFC3339),
 				len(info.Participants),
 			)
@@ -76,6 +88,9 @@ func newGroupsRenameCmd(flags *rootFlags) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if strings.TrimSpace(jidStr) == "" || strings.TrimSpace(name) == "" {
 				return fmt.Errorf("--jid and --name are required")
+			}
+			if err := flags.requireWritable(); err != nil {
+				return err
 			}
 			ctx, cancel := withTimeout(context.Background(), flags)
 			defer cancel()
@@ -124,6 +139,9 @@ func newGroupsLeaveCmd(flags *rootFlags) *cobra.Command {
 			if strings.TrimSpace(jidStr) == "" {
 				return fmt.Errorf("--jid is required")
 			}
+			if err := flags.requireWritable(); err != nil {
+				return err
+			}
 			ctx, cancel := withTimeout(context.Background(), flags)
 			defer cancel()
 
@@ -146,6 +164,7 @@ func newGroupsLeaveCmd(flags *rootFlags) *cobra.Command {
 			if err := a.WA().LeaveGroup(ctx, gjid); err != nil {
 				return err
 			}
+			_ = a.DB().MarkGroupLeft(gjid.String(), time.Now().UTC())
 			if flags.asJSON {
 				return out.WriteJSON(os.Stdout, map[string]any{"jid": gjid.String(), "left": true})
 			}

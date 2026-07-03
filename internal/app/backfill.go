@@ -7,8 +7,10 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -21,6 +23,13 @@ type BackfillOptions struct {
 	WaitPerRequest time.Duration
 	IdleExit       time.Duration
 }
+
+const (
+	DefaultBackfillCount    = 50
+	DefaultBackfillRequests = 1
+	MaxBackfillCount        = 500
+	MaxBackfillRequests     = 100
+)
 
 type BackfillResult struct {
 	ChatJID        string
@@ -49,17 +58,9 @@ func (a *App) BackfillHistory(ctx context.Context, opts BackfillOptions) (Backfi
 	}
 	chatStr = chat.String()
 
-	if opts.Count <= 0 {
-		opts.Count = 50
-	}
-	if opts.Requests <= 0 {
-		opts.Requests = 1
-	}
-	if opts.WaitPerRequest <= 0 {
-		opts.WaitPerRequest = 60 * time.Second
-	}
-	if opts.IdleExit <= 0 {
-		opts.IdleExit = 5 * time.Second
+	opts = normalizeBackfillOptions(opts)
+	if err := validateBackfillOptions(opts); err != nil {
+		return BackfillResult{}, err
 	}
 
 	if err := a.EnsureAuthed(); err != nil {
@@ -68,20 +69,20 @@ func (a *App) BackfillHistory(ctx context.Context, opts BackfillOptions) (Backfi
 	if err := a.OpenWA(); err != nil {
 		return BackfillResult{}, err
 	}
+	a.wa.SetManualHistorySyncDownload(true)
+	defer a.wa.SetManualHistorySyncDownload(false)
 
 	beforeCount, _ := a.db.CountMessages()
 
 	var mu sync.Mutex
 	var waitCh chan onDemandResponse
-	handlerID := a.wa.AddEventHandler(func(evt interface{}) {
-		hs, ok := evt.(*events.HistorySync)
-		if !ok || hs == nil || hs.Data == nil {
+	var manualMessagesStored atomic.Int64
+	var manualLastEvent atomic.Int64
+	manualLastEvent.Store(nowUTC().UnixNano())
+	handleOnDemand := func(hs *events.HistorySync) {
+		if hs == nil || hs.Data == nil || hs.Data.GetSyncType() != waHistorySync.HistorySync_ON_DEMAND {
 			return
 		}
-		if hs.Data.GetSyncType() != waHistorySync.HistorySync_ON_DEMAND {
-			return
-		}
-
 		for _, conv := range hs.Data.GetConversations() {
 			if strings.TrimSpace(conv.GetID()) != chatStr {
 				continue
@@ -102,6 +103,32 @@ func (a *App) BackfillHistory(ctx context.Context, opts BackfillOptions) (Backfi
 			default:
 			}
 			return
+		}
+	}
+	handlerID := a.wa.AddEventHandler(func(evt interface{}) {
+		switch v := evt.(type) {
+		case *events.HistorySync:
+			handleOnDemand(v)
+		case *events.Message:
+			notif := historySyncNotificationFromMessage(v)
+			if notif == nil || notif.GetSyncType() != waE2E.HistorySyncType_ON_DEMAND {
+				return
+			}
+			data, err := a.wa.DownloadHistorySync(ctx, notif)
+			if err != nil {
+				a.emitWarning(
+					"on_demand_history_download_failed",
+					fmt.Sprintf("warning: failed to download on-demand history sync: %v", err),
+					map[string]any{"error": err.Error()},
+				)
+				return
+			}
+			if data.GetSyncType() != waHistorySync.HistorySync_ON_DEMAND {
+				return
+			}
+			hs := &events.HistorySync{Data: data}
+			a.handleHistorySync(ctx, SyncOptions{}, hs, &manualMessagesStored, &manualLastEvent, func(string, string) {})
+			handleOnDemand(hs)
 		}
 	})
 	defer a.wa.RemoveEventHandler(handlerID)
@@ -140,7 +167,11 @@ func (a *App) BackfillHistory(ctx context.Context, opts BackfillOptions) (Backfi
 				mu.Unlock()
 
 				requestsSent++
-				fmt.Fprintf(os.Stderr, "Requesting %d older messages for %s...\n", opts.Count, chatStr)
+				a.emitOrPrint("backfill_requesting", map[string]any{
+					"chat_jid": chatStr,
+					"count":    opts.Count,
+					"request":  requestsSent,
+				}, "Requesting %d older messages for %s...\n", opts.Count, chatStr)
 				if _, err := a.wa.RequestHistorySyncOnDemand(ctx, reqInfo, opts.Count); err != nil {
 					return err
 				}
@@ -162,19 +193,36 @@ func (a *App) BackfillHistory(ctx context.Context, opts BackfillOptions) (Backfi
 				}
 				mu.Unlock()
 
-				fmt.Fprintf(os.Stderr, "On-demand history sync: %d conversations, %d messages.\n", resp.conversations, resp.messages)
+				a.emitOrPrint("backfill_response", map[string]any{
+					"chat_jid":       chatStr,
+					"conversations":  resp.conversations,
+					"messages":       resp.messages,
+					"responses_seen": responsesSeen,
+				}, "On-demand history sync: %d conversations, %d messages.\n", resp.conversations, resp.messages)
 
 				if resp.endType == waHistorySync.Conversation_COMPLETE_AND_NO_MORE_MESSAGE_REMAIN_ON_PRIMARY {
 					stopReason = "reached-start-of-history"
+					a.emitOrPrint("backfill_stopped", map[string]any{
+						"chat_jid": chatStr,
+						"reason":   "start_of_history_reached",
+					}, "Reached start of chat history (stopping).\n")
 					return nil
 				}
 				if resp.messages <= 0 {
 					stopReason = "empty-response"
+					a.emitOrPrint("backfill_stopped", map[string]any{
+						"chat_jid": chatStr,
+						"reason":   "no_messages_returned",
+					}, "No messages returned (stopping).\n")
 					return nil
 				}
 				newOldest, err := a.db.GetOldestMessageInfo(chatStr)
 				if err == nil && newOldest.MsgID == oldest.MsgID {
 					stopReason = "no-older-marker-change"
+					a.emitOrPrint("backfill_stopped", map[string]any{
+						"chat_jid": chatStr,
+						"reason":   "no_older_messages_added",
+					}, "No older messages were added (stopping).\n")
 					return nil
 				}
 			}
@@ -201,6 +249,32 @@ func (a *App) BackfillHistory(ctx context.Context, opts BackfillOptions) (Backfi
 		MessagesStored: syncRes.MessagesStored,
 		StopReason:     stopReason,
 	}, nil
+}
+
+func normalizeBackfillOptions(opts BackfillOptions) BackfillOptions {
+	if opts.Count <= 0 {
+		opts.Count = DefaultBackfillCount
+	}
+	if opts.Requests <= 0 {
+		opts.Requests = DefaultBackfillRequests
+	}
+	if opts.WaitPerRequest <= 0 {
+		opts.WaitPerRequest = 60 * time.Second
+	}
+	if opts.IdleExit <= 0 {
+		opts.IdleExit = 5 * time.Second
+	}
+	return opts
+}
+
+func validateBackfillOptions(opts BackfillOptions) error {
+	if opts.Count > MaxBackfillCount {
+		return fmt.Errorf("--count must be <= %d (got %d)", MaxBackfillCount, opts.Count)
+	}
+	if opts.Requests > MaxBackfillRequests {
+		return fmt.Errorf("--requests must be <= %d (got %d)", MaxBackfillRequests, opts.Requests)
+	}
+	return nil
 }
 
 // BackfillAllOptions controls BackfillAllChats behaviour.
@@ -247,10 +321,10 @@ func (a *App) BackfillAllChats(ctx context.Context, opts BackfillAllOptions) (Ba
 	}
 
 	var (
-		start         = time.Now()
-		totalAdded    int64
-		skipped       int
-		durations     []time.Duration // elapsed time per completed chat
+		start      = time.Now()
+		totalAdded int64
+		skipped    int
+		durations  []time.Duration // elapsed time per completed chat
 	)
 
 	for i, chat := range chats {

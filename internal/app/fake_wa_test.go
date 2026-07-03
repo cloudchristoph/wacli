@@ -5,12 +5,18 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/steipete/wacli/internal/wa"
+	"github.com/openclaw/wacli/internal/fsutil"
+	"github.com/openclaw/wacli/internal/wa"
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waCommon"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
+	"go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -21,24 +27,103 @@ type fakeWA struct {
 	authed        bool
 	connected     bool
 	autoReconnect bool
+	linkedLID     string
 
 	nextHandlerID uint32
 	handlers      map[uint32]func(interface{})
 
 	connectEvents []interface{}
+	connectErrs   []error
+	connectCalls  int
+	connectDelay  time.Duration
+	downloadDelay time.Duration
 
 	contacts map[types.JID]types.ContactInfo
 	groups   map[types.JID]*types.GroupInfo
+	news     map[types.JID]*types.NewsletterMetadata
+	lids     map[types.JID]types.JID
 
-	onDemandHistory func(lastKnown types.MessageInfo, count int) *events.HistorySync
+	getAllContactsErr           error
+	getJoinedGroupsErr          error
+	getSubscribedNewslettersErr error
+	decryptedReaction           *waProto.ReactionMessage
+	decryptReactionErr          error
+	sendPollCalls               []fakeSendPollCall
+	sendPollVoteCalls           []fakeSendPollVoteCall
+	decryptPollVoteFunc         func(evt *events.Message) (*waE2E.PollVoteMessage, error)
+	decryptSecretFunc           func(evt *events.Message) (*waE2E.Message, error)
+	onDemandHistory             func(lastKnown types.MessageInfo, count int) *events.HistorySync
+	onDemandEvent               func(lastKnown types.MessageInfo, count int) interface{}
+	downloadHistory             func(notif *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error)
+	deleteHistoryCalls          []*waE2E.HistorySyncNotification
+	appStateRecoveryErr         error
+	appStateFetchErr            error
+	appStateFetchEvent          func(name string, fullSync, onlyIfNotSynced bool) interface{}
+	archiveCalls                []fakeArchiveCall
+	pinCalls                    []fakePinCall
+	muteCalls                   []fakeMuteCall
+	markReadCalls               []fakeMarkReadCall
+	manualHistorySyncCalls      []bool
+	appStateRecoveries          []string
+	appStateFetches             []fakeAppStateFetch
+
+	presenceCalls   []types.Presence
+	sendPresenceErr error
+}
+
+type fakeArchiveCall struct {
+	target     types.JID
+	archive    bool
+	lastMsgTS  time.Time
+	lastMsgKey *waCommon.MessageKey
+}
+
+type fakePinCall struct {
+	target types.JID
+	pin    bool
+}
+
+type fakeMuteCall struct {
+	target   types.JID
+	mute     bool
+	duration time.Duration
+}
+
+type fakeMarkReadCall struct {
+	target     types.JID
+	read       bool
+	lastMsgTS  time.Time
+	lastMsgKey *waCommon.MessageKey
+}
+
+type fakeSendPollCall struct {
+	to         types.JID
+	name       string
+	options    []string
+	selectable int
+	ephemeral  bool
+}
+
+type fakeSendPollVoteCall struct {
+	pollInfo types.MessageInfo
+	options  []string
+}
+
+type fakeAppStateFetch struct {
+	name            string
+	fullSync        bool
+	onlyIfNotSynced bool
 }
 
 func newFakeWA() *fakeWA {
 	return &fakeWA{
 		authed:        true,
+		autoReconnect: true,
 		handlers:      map[uint32]func(interface{}){},
 		contacts:      map[types.JID]types.ContactInfo{},
 		groups:        map[types.JID]*types.GroupInfo{},
+		news:          map[types.JID]*types.NewsletterMetadata{},
+		lids:          map[types.JID]types.JID{},
 		nextHandlerID: 1,
 	}
 }
@@ -64,15 +149,52 @@ func (f *fakeWA) IsConnected() bool {
 	return f.connected
 }
 
+func (f *fakeWA) SetAutoReconnect(enabled bool) (bool, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	previous := f.autoReconnect
+	if f.connected {
+		return previous, false
+	}
+	f.autoReconnect = enabled
+	return previous, true
+}
+
 func (f *fakeWA) Connect(ctx context.Context, opts wa.ConnectOptions) error {
 	f.mu.Lock()
+	if f.connected {
+		f.mu.Unlock()
+		return nil
+	}
+	f.connectCalls++
 	authed := f.authed
+	var connectErr error
+	if len(f.connectErrs) > 0 {
+		connectErr = f.connectErrs[0]
+		f.connectErrs = f.connectErrs[1:]
+	}
 	f.connected = true
 	eventsToEmit := append([]interface{}{}, f.connectEvents...)
 	f.mu.Unlock()
 
 	if !authed && !opts.AllowQR {
+		f.mu.Lock()
+		f.connected = false
+		f.mu.Unlock()
 		return fmt.Errorf("not authenticated; run `wacli auth`")
+	}
+	if connectErr != nil {
+		f.mu.Lock()
+		f.connected = false
+		f.mu.Unlock()
+		return connectErr
+	}
+	if f.connectDelay > 0 {
+		select {
+		case <-time.After(f.connectDelay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	f.emit(&events.Connected{})
 	for _, e := range eventsToEmit {
@@ -100,17 +222,6 @@ func (f *fakeWA) ReconnectWithBackoff(ctx context.Context, minDelay, maxDelay ti
 	return f.Connect(ctx, wa.ConnectOptions{AllowQR: false})
 }
 
-func (f *fakeWA) SetAutoReconnect(enabled bool) (bool, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.connected {
-		return f.autoReconnect, false
-	}
-	previous := f.autoReconnect
-	f.autoReconnect = enabled
-	return previous, true
-}
-
 func (f *fakeWA) ResolveChatName(ctx context.Context, chat types.JID, pushName string) string {
 	if pushName != "" && pushName != "-" {
 		return pushName
@@ -120,12 +231,49 @@ func (f *fakeWA) ResolveChatName(ctx context.Context, chat types.JID, pushName s
 			return gi.GroupName.Name
 		}
 	}
+	if chat.Server == types.NewsletterServer {
+		if meta, _ := f.GetNewsletterInfo(ctx, chat); meta != nil {
+			if name := wa.NewsletterName(meta); name != "" {
+				return name
+			}
+		}
+	}
 	if info, _ := f.GetContact(ctx, chat.ToNonAD()); info.Found {
 		if name := wa.BestContactName(info); name != "" {
 			return name
 		}
 	}
 	return chat.String()
+}
+
+func (f *fakeWA) ResolveLIDToPN(ctx context.Context, jid types.JID) types.JID {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if pn, ok := f.lids[jid.ToNonAD()]; ok {
+		pn.Device = jid.Device
+		return pn
+	}
+	return jid
+}
+
+func (f *fakeWA) ResolvePNToLID(ctx context.Context, jid types.JID) types.JID {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for lid, pn := range f.lids {
+		if pn == jid.ToNonAD() {
+			lid.Device = jid.Device
+			return lid
+		}
+	}
+	return jid
+}
+
+func (f *fakeWA) GetUserInfo(ctx context.Context, jids []types.JID) (map[types.JID]types.UserInfo, error) {
+	return map[types.JID]types.UserInfo{}, nil
+}
+
+func (f *fakeWA) IsOnWhatsApp(ctx context.Context, phones []string) ([]types.IsOnWhatsAppResponse, error) {
+	return nil, nil
 }
 
 func (f *fakeWA) GetContact(ctx context.Context, jid types.JID) (types.ContactInfo, error) {
@@ -140,6 +288,9 @@ func (f *fakeWA) GetContact(ctx context.Context, jid types.JID) (types.ContactIn
 func (f *fakeWA) GetAllContacts(ctx context.Context) (map[types.JID]types.ContactInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.getAllContactsErr != nil {
+		return nil, f.getAllContactsErr
+	}
 	out := make(map[types.JID]types.ContactInfo, len(f.contacts))
 	for k, v := range f.contacts {
 		out[k] = v
@@ -150,6 +301,9 @@ func (f *fakeWA) GetAllContacts(ctx context.Context) (map[types.JID]types.Contac
 func (f *fakeWA) GetJoinedGroups(ctx context.Context) ([]*types.GroupInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.getJoinedGroupsErr != nil {
+		return nil, f.getJoinedGroupsErr
+	}
 	out := make([]*types.GroupInfo, 0, len(f.groups))
 	for _, g := range f.groups {
 		out = append(out, g)
@@ -163,6 +317,28 @@ func (f *fakeWA) GetGroupInfo(ctx context.Context, jid types.JID) (*types.GroupI
 	return f.groups[jid], nil
 }
 
+func (f *fakeWA) CreateGroup(ctx context.Context, req wa.CreateGroupRequest) (*types.GroupInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	jid := types.NewJID(fmt.Sprintf("group-%d", len(f.groups)+1), types.GroupServer)
+	g := &types.GroupInfo{
+		JID:           jid,
+		GroupName:     types.GroupName{Name: req.Name},
+		GroupAnnounce: types.GroupAnnounce{IsAnnounce: req.IsAnnounce},
+		GroupLocked:   types.GroupLocked{IsLocked: req.IsLocked},
+		GroupMembershipApprovalMode: types.GroupMembershipApprovalMode{
+			IsJoinApprovalRequired: req.IsJoinApprovalRequired,
+		},
+		GroupParent:       types.GroupParent{IsParent: req.IsParent},
+		GroupLinkedParent: types.GroupLinkedParent{LinkedParentJID: req.LinkedParentJID},
+	}
+	for _, p := range req.Participants {
+		g.Participants = append(g.Participants, types.GroupParticipant{JID: p})
+	}
+	f.groups[jid] = g
+	return g, nil
+}
+
 func (f *fakeWA) SetGroupName(ctx context.Context, jid types.JID, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -172,6 +348,42 @@ func (f *fakeWA) SetGroupName(ctx context.Context, jid types.JID, name string) e
 		f.groups[jid] = g
 	}
 	g.GroupName.Name = name
+	return nil
+}
+
+func (f *fakeWA) SetGroupTopic(ctx context.Context, jid types.JID, topic string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	g := f.groups[jid]
+	if g == nil {
+		g = &types.GroupInfo{JID: jid}
+		f.groups[jid] = g
+	}
+	g.GroupTopic.Topic = topic
+	return nil
+}
+
+func (f *fakeWA) SetGroupAnnounce(ctx context.Context, jid types.JID, announce bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	g := f.groups[jid]
+	if g == nil {
+		g = &types.GroupInfo{JID: jid}
+		f.groups[jid] = g
+	}
+	g.GroupAnnounce.IsAnnounce = announce
+	return nil
+}
+
+func (f *fakeWA) SetGroupLocked(ctx context.Context, jid types.JID, locked bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	g := f.groups[jid]
+	if g == nil {
+		g = &types.GroupInfo{JID: jid}
+		f.groups[jid] = g
+	}
+	g.GroupLocked.IsLocked = locked
 	return nil
 }
 
@@ -206,6 +418,18 @@ func (f *fakeWA) UpdateGroupParticipants(ctx context.Context, group types.JID, u
 	return g.Participants, nil
 }
 
+func (f *fakeWA) GetGroupRequestParticipants(ctx context.Context, group types.JID) ([]types.GroupParticipantRequest, error) {
+	return nil, nil
+}
+
+func (f *fakeWA) UpdateGroupRequestParticipants(ctx context.Context, group types.JID, users []types.JID, action wa.GroupParticipantRequestAction) ([]types.GroupParticipant, error) {
+	out := make([]types.GroupParticipant, 0, len(users))
+	for _, u := range users {
+		out = append(out, types.GroupParticipant{JID: u})
+	}
+	return out, nil
+}
+
 func (f *fakeWA) GetGroupInviteLink(ctx context.Context, group types.JID, reset bool) (string, error) {
 	return "https://chat.whatsapp.com/invite/test", nil
 }
@@ -216,6 +440,40 @@ func (f *fakeWA) JoinGroupWithLink(ctx context.Context, code string) (types.JID,
 
 func (f *fakeWA) LeaveGroup(ctx context.Context, group types.JID) error { return nil }
 
+func (f *fakeWA) GetNewsletterInfoWithInvite(ctx context.Context, key string) (*types.NewsletterMetadata, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, meta := range f.news {
+		if meta.ThreadMeta.InviteCode == key || strings.HasSuffix(key, meta.ThreadMeta.InviteCode) {
+			return meta, nil
+		}
+	}
+	return nil, nil
+}
+
+func (f *fakeWA) FollowNewsletter(ctx context.Context, jid types.JID) error { return nil }
+
+func (f *fakeWA) UnfollowNewsletter(ctx context.Context, jid types.JID) error { return nil }
+
+func (f *fakeWA) GetSubscribedNewsletters(ctx context.Context) ([]*types.NewsletterMetadata, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.getSubscribedNewslettersErr != nil {
+		return nil, f.getSubscribedNewslettersErr
+	}
+	out := make([]*types.NewsletterMetadata, 0, len(f.news))
+	for _, meta := range f.news {
+		out = append(out, meta)
+	}
+	return out, nil
+}
+
+func (f *fakeWA) GetNewsletterInfo(ctx context.Context, jid types.JID) (*types.NewsletterMetadata, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.news[jid], nil
+}
+
 func (f *fakeWA) SendText(ctx context.Context, to types.JID, text string) (types.MessageID, error) {
 	return types.MessageID("msgid"), nil
 }
@@ -225,22 +483,175 @@ func (f *fakeWA) SendTextReply(ctx context.Context, to types.JID, text string, r
 }
 
 func (f *fakeWA) SendProtoMessage(ctx context.Context, to types.JID, msg *waProto.Message) (types.MessageID, error) {
+	return f.SendProtoMessageWithExtra(ctx, to, msg, "")
+}
+
+func (f *fakeWA) SendProtoMessageWithExtra(ctx context.Context, to types.JID, msg *waProto.Message, mediaHandle string) (types.MessageID, error) {
 	return types.MessageID("msgid"), nil
+}
+
+func (f *fakeWA) SendReaction(ctx context.Context, chat, sender types.JID, targetID types.MessageID, reaction string) (types.MessageID, error) {
+	return types.MessageID("reactionid"), nil
+}
+
+func (f *fakeWA) SendPoll(ctx context.Context, to types.JID, name string, options []string, selectable int, ephemeral bool) (types.MessageID, error) {
+	f.mu.Lock()
+	f.sendPollCalls = append(f.sendPollCalls, fakeSendPollCall{
+		to:         to,
+		name:       name,
+		options:    append([]string(nil), options...),
+		selectable: selectable,
+		ephemeral:  ephemeral,
+	})
+	f.mu.Unlock()
+	return types.MessageID("pollid"), nil
+}
+
+func (f *fakeWA) SendPollVote(ctx context.Context, pollInfo *types.MessageInfo, options []string) (types.MessageID, error) {
+	if pollInfo == nil {
+		return "", fmt.Errorf("poll info required")
+	}
+	f.mu.Lock()
+	f.sendPollVoteCalls = append(f.sendPollVoteCalls, fakeSendPollVoteCall{
+		pollInfo: *pollInfo,
+		options:  append([]string(nil), options...),
+	})
+	f.mu.Unlock()
+	return types.MessageID("pollvoteid"), nil
+}
+
+func (f *fakeWA) DecryptPollVote(ctx context.Context, evt *events.Message) (*waE2E.PollVoteMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	cb := f.decryptPollVoteFunc
+	f.mu.Unlock()
+	if cb != nil {
+		return cb(evt)
+	}
+	return nil, fmt.Errorf("not supported")
+}
+
+func (f *fakeWA) DecryptSecretEncryptedMessage(ctx context.Context, evt *events.Message) (*waE2E.Message, error) {
+	f.mu.Lock()
+	cb := f.decryptSecretFunc
+	f.mu.Unlock()
+	if cb != nil {
+		return cb(evt)
+	}
+	return nil, fmt.Errorf("not supported")
+}
+
+func (f *fakeWA) RevokeMessage(ctx context.Context, chat types.JID, targetID types.MessageID) (types.MessageID, error) {
+	return types.MessageID("revokeid"), nil
+}
+
+func (f *fakeWA) EditMessage(ctx context.Context, chat types.JID, targetID types.MessageID, text string) (types.MessageID, error) {
+	return types.MessageID("editid"), nil
 }
 
 func (f *fakeWA) Upload(ctx context.Context, data []byte, mediaType whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
 	return whatsmeow.UploadResponse{}, nil
 }
 
+func (f *fakeWA) UploadNewsletter(ctx context.Context, data []byte, mediaType whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
+	return whatsmeow.UploadResponse{Handle: "newsletter-media-handle"}, nil
+}
+
+func (f *fakeWA) SendChatPresence(ctx context.Context, jid types.JID, state types.ChatPresence, media types.ChatPresenceMedia) error {
+	return nil
+}
+
+func (f *fakeWA) SendPresence(ctx context.Context, presence types.Presence) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.presenceCalls = append(f.presenceCalls, presence)
+	return f.sendPresenceErr
+}
+
 func (f *fakeWA) DecryptReaction(ctx context.Context, reaction *events.Message) (*waProto.ReactionMessage, error) {
+	if f.decryptReactionErr != nil {
+		return nil, f.decryptReactionErr
+	}
+	if f.decryptedReaction != nil {
+		return f.decryptedReaction, nil
+	}
 	return nil, fmt.Errorf("not supported")
 }
 
+func (f *fakeWA) SetManualHistorySyncDownload(enabled bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.manualHistorySyncCalls = append(f.manualHistorySyncCalls, enabled)
+}
+
+func (f *fakeWA) DownloadHistorySync(ctx context.Context, notif *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error) {
+	f.mu.Lock()
+	cb := f.downloadHistory
+	f.mu.Unlock()
+	if cb == nil {
+		return nil, fmt.Errorf("not supported")
+	}
+	return cb(notif)
+}
+
+func (f *fakeWA) DeleteHistorySyncMedia(ctx context.Context, notif *waE2E.HistorySyncNotification) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleteHistoryCalls = append(f.deleteHistoryCalls, notif)
+	return nil
+}
+
+func (f *fakeWA) ParseWebMessage(chatJID types.JID, webMsg *waWeb.WebMessageInfo) (*events.Message, error) {
+	if chatJID.IsEmpty() {
+		parsed, err := types.ParseJID(webMsg.GetKey().GetRemoteJID())
+		if err != nil {
+			return nil, err
+		}
+		chatJID = parsed
+	}
+	sender := chatJID
+	if webMsg.GetKey().GetFromMe() {
+		if linked, err := types.ParseJID(f.LinkedJID()); err == nil {
+			sender = linked
+		}
+	} else if participant := webMsg.GetParticipant(); participant != "" {
+		parsed, err := types.ParseJID(participant)
+		if err != nil {
+			return nil, err
+		}
+		sender = parsed
+	}
+	evt := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chatJID,
+				Sender:   sender,
+				IsFromMe: webMsg.GetKey().GetFromMe(),
+				IsGroup:  chatJID.Server == types.GroupServer,
+			},
+			ID:        webMsg.GetKey().GetID(),
+			Timestamp: time.Unix(int64(webMsg.GetMessageTimestamp()), 0).UTC(),
+		},
+		RawMessage: webMsg.GetMessage(),
+	}
+	evt.UnwrapRaw()
+	return evt, nil
+}
+
 func (f *fakeWA) DownloadMediaToFile(ctx context.Context, directPath string, encFileHash, fileHash, mediaKey []byte, fileLength uint64, mediaType, mmsType string, targetPath string) (int64, error) {
+	if f.downloadDelay > 0 {
+		select {
+		case <-time.After(f.downloadDelay):
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
 		return 0, err
 	}
-	if err := os.WriteFile(targetPath, []byte("test"), 0o600); err != nil {
+	if err := fsutil.WritePrivateFile(targetPath, []byte("test")); err != nil {
 		return 0, err
 	}
 	st, err := os.Stat(targetPath)
@@ -252,12 +663,78 @@ func (f *fakeWA) DownloadMediaToFile(ctx context.Context, directPath string, enc
 
 func (f *fakeWA) RequestHistorySyncOnDemand(ctx context.Context, lastKnown types.MessageInfo, count int) (types.MessageID, error) {
 	f.mu.Lock()
+	eventCB := f.onDemandEvent
 	cb := f.onDemandHistory
 	f.mu.Unlock()
-	if cb != nil {
+	if eventCB != nil {
+		f.emit(eventCB(lastKnown, count))
+	} else if cb != nil {
 		f.emit(cb(lastKnown, count))
 	}
 	return types.MessageID("req"), nil
+}
+
+func (f *fakeWA) RequestAppStateRecovery(ctx context.Context, name string) (types.MessageID, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.appStateRecoveryErr != nil {
+		return "", f.appStateRecoveryErr
+	}
+	f.appStateRecoveries = append(f.appStateRecoveries, name)
+	return types.MessageID("recovery-req"), nil
+}
+
+func (f *fakeWA) DeleteMessageForMe(ctx context.Context, info types.MessageInfo, deleteMedia bool) error {
+	return nil
+}
+
+func (f *fakeWA) ArchiveChat(ctx context.Context, target types.JID, archive bool, lastMsgTS time.Time, lastMsgKey *waCommon.MessageKey) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.archiveCalls = append(f.archiveCalls, fakeArchiveCall{target: target, archive: archive, lastMsgTS: lastMsgTS, lastMsgKey: lastMsgKey})
+	return nil
+}
+
+func (f *fakeWA) PinChat(ctx context.Context, target types.JID, pin bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pinCalls = append(f.pinCalls, fakePinCall{target: target, pin: pin})
+	return nil
+}
+
+func (f *fakeWA) MuteChat(ctx context.Context, target types.JID, mute bool, duration time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.muteCalls = append(f.muteCalls, fakeMuteCall{target: target, mute: mute, duration: duration})
+	return nil
+}
+
+func (f *fakeWA) MarkChatAsRead(ctx context.Context, target types.JID, read bool, lastMsgTS time.Time, lastMsgKey *waCommon.MessageKey) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.markReadCalls = append(f.markReadCalls, fakeMarkReadCall{target: target, read: read, lastMsgTS: lastMsgTS, lastMsgKey: lastMsgKey})
+	return nil
+}
+
+func (f *fakeWA) FetchAppState(ctx context.Context, name string, fullSync, onlyIfNotSynced bool) error {
+	f.mu.Lock()
+	f.appStateFetches = append(f.appStateFetches, fakeAppStateFetch{
+		name:            name,
+		fullSync:        fullSync,
+		onlyIfNotSynced: onlyIfNotSynced,
+	})
+	err := f.appStateFetchErr
+	eventCB := f.appStateFetchEvent
+	f.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if eventCB != nil {
+		if evt := eventCB(name, fullSync, onlyIfNotSynced); evt != nil {
+			f.emit(evt)
+		}
+	}
+	return nil
 }
 
 func (f *fakeWA) Logout(ctx context.Context) error {
@@ -265,4 +742,40 @@ func (f *fakeWA) Logout(ctx context.Context) error {
 	defer f.mu.Unlock()
 	f.authed = false
 	return nil
+}
+
+func (f *fakeWA) SetProfilePicture(ctx context.Context, avatar []byte) (string, error) {
+	return "pic-id-fake", nil
+}
+
+func (f *fakeWA) GetProfilePictureInfo(ctx context.Context, jid types.JID, preview bool, existingID string) (*types.ProfilePictureInfo, error) {
+	return &types.ProfilePictureInfo{ID: "pic-id-fake", URL: "https://example.invalid/avatar.jpg", Type: "image"}, nil
+}
+
+func (f *fakeWA) SetStatusMessage(ctx context.Context, msg string) error {
+	return nil
+}
+
+func (f *fakeWA) SetProfileName(ctx context.Context, name string) error {
+	return nil
+}
+
+func (f *fakeWA) GetBusinessProfile(ctx context.Context, jid types.JID) (*types.BusinessProfile, error) {
+	return &types.BusinessProfile{JID: jid}, nil
+}
+
+func (f *fakeWA) LinkedJID() string {
+	if !f.IsAuthed() {
+		return ""
+	}
+	return "1234567890@s.whatsapp.net"
+}
+
+func (f *fakeWA) LinkedLID() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.authed {
+		return ""
+	}
+	return f.linkedLID
 }

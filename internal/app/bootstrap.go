@@ -2,7 +2,8 @@ package app
 
 import (
 	"context"
-	"time"
+
+	"github.com/openclaw/wacli/internal/wa"
 )
 
 func (a *App) refreshContacts(ctx context.Context) error {
@@ -14,6 +15,7 @@ func (a *App) refreshContacts(ctx context.Context) error {
 		return err
 	}
 	for jid, info := range contacts {
+		jid = canonicalJID(jid)
 		_ = a.db.UpsertContact(
 			jid.String(),
 			jid.User,
@@ -34,13 +36,37 @@ func (a *App) refreshGroups(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	now := time.Now().UTC()
+	now := nowUTC()
+	joined := map[string]bool{}
 	for _, g := range groups {
 		if g == nil {
 			continue
 		}
-		_ = a.db.UpsertGroup(g.JID.String(), g.GroupName.Name, g.OwnerJID.String(), g.GroupCreated)
+		joined[g.JID.String()] = true
+		_ = a.db.UpsertGroupWithHierarchy(g.JID.String(), g.GroupName.Name, g.OwnerJID.String(), g.GroupCreated, g.IsParent, g.LinkedParentJID.String())
 		_ = a.db.UpsertChat(g.JID.String(), "group", g.GroupName.Name, now)
+	}
+	return a.db.MarkGroupsMissingFrom(joined, now)
+}
+
+func (a *App) refreshNewsletters(ctx context.Context) error {
+	if err := a.OpenWA(); err != nil {
+		return err
+	}
+	list, err := a.wa.GetSubscribedNewsletters(ctx)
+	if err != nil {
+		return err
+	}
+	now := nowUTC()
+	for _, meta := range list {
+		if meta == nil {
+			continue
+		}
+		name := wa.NewsletterName(meta)
+		if name == "" {
+			name = meta.ID.String()
+		}
+		_ = a.db.UpsertChat(meta.ID.String(), "newsletter", name, now)
 	}
 	return nil
 }

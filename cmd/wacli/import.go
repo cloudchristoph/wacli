@@ -6,9 +6,9 @@ import (
 	"os"
 	"strings"
 
+	"github.com/openclaw/wacli/internal/app"
+	"github.com/openclaw/wacli/internal/out"
 	"github.com/spf13/cobra"
-	"github.com/steipete/wacli/internal/app"
-	"github.com/steipete/wacli/internal/out"
 )
 
 func newImportCmd(flags *rootFlags) *cobra.Command {
@@ -32,6 +32,9 @@ func newImportIPhoneBackupCmd(flags *rootFlags) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !migrateMediaPathsOnly && strings.TrimSpace(path) == "" {
 				return fmt.Errorf("--path is required")
+			}
+			if err := flags.requireWritable(); err != nil {
+				return err
 			}
 
 			ctx, cancel := withTimeout(context.Background(), flags)

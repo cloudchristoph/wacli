@@ -31,6 +31,6 @@ func WriteError(w io.Writer, asJSON bool, err error) error {
 		_, _ = fmt.Fprintln(w, string(b))
 		return nil
 	}
-	_, _ = fmt.Fprintln(w, err.Error())
+	_, _ = fmt.Fprintln(w, SanitizeHuman(err.Error()))
 	return nil
 }

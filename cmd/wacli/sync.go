@@ -4,119 +4,52 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
+	appPkg "github.com/openclaw/wacli/internal/app"
+	"github.com/openclaw/wacli/internal/out"
 	"github.com/spf13/cobra"
-	appPkg "github.com/steipete/wacli/internal/app"
-	"github.com/steipete/wacli/internal/ipc"
-	"github.com/steipete/wacli/internal/out"
-	"github.com/steipete/wacli/internal/store"
-	"github.com/steipete/wacli/internal/wa"
 )
-
-// syncHandler implements ipc.Handler for the sync daemon.
-type syncHandler struct {
-	app *appPkg.App
-}
-
-func (h *syncHandler) SendText(to, message string) (string, error) {
-	if h.app == nil {
-		return "", fmt.Errorf("app not initialized")
-	}
-	if h.app.WA() == nil {
-		return "", fmt.Errorf("whatsapp client not initialized")
-	}
-	if !h.app.WA().IsConnected() {
-		return "", fmt.Errorf("whatsapp not connected")
-	}
-	
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	
-	toJID, err := wa.ParseUserOrJID(to)
-	if err != nil {
-		return "", fmt.Errorf("parse recipient: %w", err)
-	}
-	
-	msgID, err := h.app.WA().SendText(ctx, toJID, message)
-	if err != nil {
-		return "", fmt.Errorf("send: %w", err)
-	}
-	
-	// Store the message in the local DB
-	now := time.Now().UTC()
-	chat := toJID
-	chatName := h.app.WA().ResolveChatName(ctx, chat, "")
-	kind := chatKindFromJID(chat)
-	_ = h.app.DB().UpsertChat(chat.String(), kind, chatName, now)
-	_ = h.app.DB().UpsertMessage(store.UpsertMessageParams{
-		ChatJID:    chat.String(),
-		ChatName:   chatName,
-		MsgID:      string(msgID),
-		SenderJID:  "",
-		SenderName: "me",
-		Timestamp:  now,
-		FromMe:     true,
-		Text:       message,
-	})
-	
-	return string(msgID), nil
-}
-
-func (h *syncHandler) DeleteMessage(chat, msgID string, forEveryone bool) error {
-	if h.app == nil {
-		return fmt.Errorf("app not initialized")
-	}
-	if h.app.WA() == nil {
-		return fmt.Errorf("whatsapp client not initialized")
-	}
-	if !h.app.WA().IsConnected() {
-		return fmt.Errorf("whatsapp not connected")
-	}
-	
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	
-	chatJID, err := wa.ParseUserOrJID(chat)
-	if err != nil {
-		return fmt.Errorf("parse chat: %w", err)
-	}
-	
-	// Type assert to get the concrete client
-	waClient, ok := h.app.WA().(*wa.Client)
-	if !ok {
-		return fmt.Errorf("unexpected WA client type")
-	}
-	
-	return waClient.RevokeMessage(ctx, chatJID, msgID, forEveryone)
-}
 
 func newSyncCmd(flags *rootFlags) *cobra.Command {
 	var once bool
 	var follow bool
 	var idleExit time.Duration
+	var maxReconnect time.Duration
+	var staleThreshold time.Duration
 	var downloadMedia bool
 	var refreshContacts bool
 	var refreshGroups bool
-	var enableIPC bool
 	var noConsolidateLIDs bool
-	var staleThreshold time.Duration
+	var refreshChannels bool
+	var webhookURL string
+	var webhookSecret string
+	var webhookAllowPrivate bool
+	var storage syncStorageLimitFlags
 
 	cmd := &cobra.Command{
 		Use:   "sync",
 		Short: "Sync messages (requires prior auth; never shows QR)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-			defer stop()
-
+			if err := flags.requireWritable(); err != nil {
+				return err
+			}
+			storage.maxMessagesSet = cmd.Flags().Changed("max-messages")
+			maxMessages, maxDBSize, err := resolveSyncStorageLimits(storage)
+			if err != nil {
+				return err
+			}
+			if webhookSecret != "" && webhookURL == "" {
+				return fmt.Errorf("--webhook-secret requires --webhook")
+			}
 			if staleThreshold != 0 && staleThreshold < time.Second {
 				return fmt.Errorf("--stale-threshold must be at least 1s, got %s", staleThreshold)
 			}
 			if maxStaleThreshold := appPkg.MaxStaleThreshold(); staleThreshold >= maxStaleThreshold {
 				return fmt.Errorf("--stale-threshold must be less than %s because whatsmeow auto-reconnects after that much keepalive failure, got %s", maxStaleThreshold, staleThreshold)
 			}
+			ctx, stop := signalContextWithEvents(out.NewEventWriter(os.Stderr, flags.events))
+			defer stop()
 
 			a, lk, err := newApp(ctx, flags, true, false)
 			if err != nil {
@@ -137,26 +70,41 @@ func newSyncCmd(flags *rootFlags) *cobra.Command {
 				mode = appPkg.SyncModeOnce
 			}
 
-			// Start IPC server if enabled (default for --follow mode)
-			var ipcServer *ipc.Server
-			if enableIPC && mode == appPkg.SyncModeFollow {
-				handler := &syncHandler{app: a}
-				ipcServer = ipc.NewServer(a.StoreDir(), handler)
-				if err := ipcServer.Start(); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to start IPC server: %v\n", err)
-				} else {
-					defer ipcServer.Stop()
+			var stopSendDelegate func()
+			defer func() {
+				if stopSendDelegate != nil {
+					stopSendDelegate()
+				}
+			}()
+			var afterConnect func(context.Context) error
+			if mode == appPkg.SyncModeFollow {
+				afterConnect = func(ctx context.Context) error {
+					stop, err := startSendDelegateServer(ctx, a)
+					if err != nil {
+						return err
+					}
+					stopSendDelegate = stop
+					return nil
 				}
 			}
 
 			res, err := a.Sync(ctx, appPkg.SyncOptions{
-				Mode:            mode,
-				AllowQR:         false,
-				DownloadMedia:   downloadMedia,
-				RefreshContacts: refreshContacts,
-				RefreshGroups:   refreshGroups,
-				IdleExit:        idleExit,
-				StaleThreshold:  staleThreshold,
+				Mode:                mode,
+				AllowQR:             false,
+				AfterConnect:        afterConnect,
+				DownloadMedia:       downloadMedia,
+				RefreshContacts:     refreshContacts,
+				RefreshGroups:       refreshGroups,
+				RefreshChannels:     refreshChannels,
+				IdleExit:            idleExit,
+				MaxReconnect:        maxReconnect,
+				StaleThreshold:      staleThreshold,
+				MaxMessages:         maxMessages,
+				MaxDBSizeBytes:      maxDBSize,
+				WarnNoLimits:        true,
+				WebhookURL:          webhookURL,
+				WebhookSecret:       webhookSecret,
+				WebhookAllowPrivate: webhookAllowPrivate,
 			})
 			if err != nil {
 				return err
@@ -172,8 +120,8 @@ func newSyncCmd(flags *rootFlags) *cobra.Command {
 
 			if flags.asJSON {
 				return out.WriteJSON(os.Stdout, map[string]any{
-					"synced":           true,
-					"messages_stored":  res.MessagesStored,
+					"synced":            true,
+					"messages_stored":   res.MessagesStored,
 					"lids_consolidated": consolidateRes,
 				})
 			}
@@ -188,11 +136,17 @@ func newSyncCmd(flags *rootFlags) *cobra.Command {
 	cmd.Flags().BoolVar(&once, "once", false, "sync until idle and exit")
 	cmd.Flags().BoolVar(&follow, "follow", true, "keep syncing until Ctrl+C")
 	cmd.Flags().DurationVar(&idleExit, "idle-exit", 30*time.Second, "exit after being idle (once mode)")
+	cmd.Flags().DurationVar(&maxReconnect, "max-reconnect", 5*time.Minute, "give up reconnecting after this duration (0 = unlimited)")
+	cmd.Flags().DurationVar(&staleThreshold, "stale-threshold", 0, "force reconnect when keepalive failures last this long in follow mode (1s-<2m20s, 0 = disabled)")
 	cmd.Flags().BoolVar(&downloadMedia, "download-media", false, "download media in the background during sync")
 	cmd.Flags().BoolVar(&refreshContacts, "refresh-contacts", false, "refresh contacts from session store into local DB")
 	cmd.Flags().BoolVar(&refreshGroups, "refresh-groups", false, "refresh joined groups (live) into local DB")
-	cmd.Flags().BoolVar(&enableIPC, "enable-ipc", true, "enable IPC socket for send commands (--follow mode only)")
 	cmd.Flags().BoolVar(&noConsolidateLIDs, "no-consolidate-lids", false, "skip merging @lid chats into their phone-number chats after sync")
-	cmd.Flags().DurationVar(&staleThreshold, "stale-threshold", 0, "force reconnect when keepalive failures last this long in follow mode (1s-<2m20s, 0 = disabled)")
+	cmd.Flags().BoolVar(&refreshChannels, "refresh-channels", false, "refresh subscribed channels (live) into local DB")
+	cmd.Flags().StringVar(&webhookURL, "webhook", "", "URL to POST live message JSON")
+	cmd.Flags().StringVar(&webhookSecret, "webhook-secret", "", "HMAC-SHA256 secret for X-Wacli-Signature header")
+	cmd.Flags().BoolVar(&webhookAllowPrivate, "webhook-allow-private", false, "allow webhook URLs that resolve to localhost or private networks")
+	cmd.Flags().Int64Var(&storage.maxMessages, "max-messages", 0, "maximum total messages to keep in the local DB before sync stops (0 = unlimited, or WACLI_SYNC_MAX_MESSAGES)")
+	cmd.Flags().StringVar(&storage.maxDBSize, "max-db-size", "", "maximum wacli.db disk usage before sync stops, e.g. 500MB or 2GB (default: WACLI_SYNC_MAX_DB_SIZE or unlimited)")
 	return cmd
 }

@@ -3,12 +3,13 @@ package app
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/steipete/wacli/internal/store"
+	"github.com/openclaw/wacli/internal/store"
 )
 
 func TestConsolidateLIDChatsReport(t *testing.T) {
@@ -58,7 +59,7 @@ func TestConsolidateLIDChatsReport(t *testing.T) {
 	if res.Details[1].SkippedReason != "no-source-chat" {
 		t.Fatalf("expected no-source-chat detail, got %+v", res.Details[1])
 	}
-	if _, err := a.DB().GetChat("lid-alice@lid"); !store.IsNotFound(err) {
+	if _, err := a.DB().GetChat("lid-alice@lid"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("expected lid chat to be merged away, err=%v", err)
 	}
 }

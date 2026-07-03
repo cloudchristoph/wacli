@@ -3,13 +3,14 @@ package app
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/steipete/wacli/internal/store"
+	"github.com/openclaw/wacli/internal/store"
 )
 
 func TestImportIPhoneBackup(t *testing.T) {
@@ -98,9 +99,9 @@ func TestImportIPhoneBackup(t *testing.T) {
 		t.Fatalf("expected copied media content to match source, got %q", string(body))
 	}
 
-	starred, err := a.DB().ListStarred("", time.Time{})
+	starred, err := a.DB().ListStarredMessages(store.ListStarredMessagesParams{})
 	if err != nil {
-		t.Fatalf("ListStarred: %v", err)
+		t.Fatalf("ListStarredMessages: %v", err)
 	}
 	if len(starred) != 1 || starred[0].MsgID != "m1" {
 		t.Fatalf("unexpected starred messages: %+v", starred)
@@ -154,19 +155,20 @@ func TestImportIPhoneBackupMigratesLegacyMediaLocalPath(t *testing.T) {
 		t.Fatalf("UpsertChat group: %v", err)
 	}
 	if err := a.DB().UpsertMessage(store.UpsertMessageParams{
-		ChatJID:      "120363000000000000@g.us",
-		ChatName:     "Project Team",
-		MsgID:        "ios-backup-101",
-		SenderJID:    "491111111111@s.whatsapp.net",
-		SenderName:   "Bob Builder",
-		Timestamp:    time.Now().UTC().Add(-time.Hour),
-		MediaType:    "image",
-		Filename:     "photo.jpg",
-		MimeType:     "image/jpeg",
-		LocalPath:    legacyPath,
-		DownloadedAt: time.Now().UTC().Add(-time.Hour),
+		ChatJID:    "120363000000000000@g.us",
+		ChatName:   "Project Team",
+		MsgID:      "ios-backup-101",
+		SenderJID:  "491111111111@s.whatsapp.net",
+		SenderName: "Bob Builder",
+		Timestamp:  time.Now().UTC().Add(-time.Hour),
+		MediaType:  "image",
+		Filename:   "photo.jpg",
+		MimeType:   "image/jpeg",
 	}); err != nil {
 		t.Fatalf("UpsertMessage preexisting media: %v", err)
+	}
+	if err := a.DB().MarkMediaDownloaded("120363000000000000@g.us", "ios-backup-101", legacyPath, time.Now().UTC().Add(-time.Hour)); err != nil {
+		t.Fatalf("MarkMediaDownloaded preexisting media: %v", err)
 	}
 
 	if _, err := a.ImportIPhoneBackup(ctx, backupDir, IPhoneBackupImportOptions{}); err != nil {
@@ -232,7 +234,7 @@ func TestImportIPhoneBackupMergesExistingAlternateChatIdentity(t *testing.T) {
 		t.Fatalf("ImportIPhoneBackup: %v", err)
 	}
 
-	if _, err := a.DB().GetChat("lid-alice@lid"); !store.IsNotFound(err) {
+	if _, err := a.DB().GetChat("lid-alice@lid"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("expected lid chat to be merged away, err=%v", err)
 	}
 
@@ -286,19 +288,20 @@ func TestImportIPhoneBackupMigrateMediaPathsOnly(t *testing.T) {
 		t.Fatalf("UpsertChat: %v", err)
 	}
 	if err := a.DB().UpsertMessage(store.UpsertMessageParams{
-		ChatJID:      chatJID,
-		ChatName:     "Legacy Only",
-		MsgID:        msgID,
-		SenderJID:    chatJID,
-		SenderName:   "Legacy Only",
-		Timestamp:    time.Now().UTC(),
-		MediaType:    "image",
-		Filename:     "legacy-only-photo.jpg",
-		MimeType:     "image/jpeg",
-		LocalPath:    legacyPath,
-		DownloadedAt: time.Now().UTC(),
+		ChatJID:    chatJID,
+		ChatName:   "Legacy Only",
+		MsgID:      msgID,
+		SenderJID:  chatJID,
+		SenderName: "Legacy Only",
+		Timestamp:  time.Now().UTC(),
+		MediaType:  "image",
+		Filename:   "legacy-only-photo.jpg",
+		MimeType:   "image/jpeg",
 	}); err != nil {
 		t.Fatalf("UpsertMessage: %v", err)
+	}
+	if err := a.DB().MarkMediaDownloaded(chatJID, msgID, legacyPath, time.Now().UTC()); err != nil {
+		t.Fatalf("MarkMediaDownloaded: %v", err)
 	}
 
 	res, err := a.ImportIPhoneBackup(ctx, "", IPhoneBackupImportOptions{MigrateMediaPathsOnly: true})
